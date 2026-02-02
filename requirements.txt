@@ -1,3 +1,2 @@
 openai
 tweepy
-requests
