@@ -6,10 +6,10 @@ from openai import OpenAI
 # 🔑 ضع مفاتيحك هنا
 # =======================
 OPENAI_API_KEY = ""
-X_API_KEY = "18i7DNt6y3vB3gzJD21hwF1vw"
-X_API_SECRET = "fknRHlo32Hp1Fj7GrDvm36x5WXr8pqod7nm0f6cGUe5biI5AQc"
-X_ACCESS_TOKEN = "2017595380343476224-lpN3BL4EHDc9E9TQRBU0WrRAzuwIi4"
-X_ACCESS_SECRET = "PuwWEeeahbw1kYnw2ZTCvdotUETyIQ81VzxxG4DnWKj0Q"
+X_API_KEY = ""
+X_API_SECRET = ""
+X_ACCESS_TOKEN = ""
+X_ACCESS_SECRET = ""
 
 # =======================
 # إعداد OpenAI
