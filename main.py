@@ -580,6 +580,33 @@ def run_recovery_mode(client: tweepy.Client, ai: OpenAI, state: dict) -> bool:
     return False
 
 
+# ── Persistent storage probe ──────────────────────────────────────────────────
+
+def probe_data_dir() -> None:
+    """Verify the data directory is writable before the bot starts.
+
+    Writes and removes a sentinel file.  Fails fast with a clear error if the
+    Railway Volume is not mounted — better than silently writing to an
+    ephemeral container layer that disappears on every redeploy.
+    """
+    data_dir = STATE_FILE_PATH.parent
+    sentinel = data_dir / ".write_probe"
+    try:
+        data_dir.mkdir(parents=True, exist_ok=True)
+        sentinel.write_text("ok")
+        sentinel.unlink()
+        log.info(f"  Storage probe : {data_dir} is writable ✓")
+    except OSError as exc:
+        log.error(
+            f"  Storage probe FAILED: cannot write to {data_dir}\n"
+            f"  {exc}\n"
+            f"  → Create a Railway Volume named 'bot_data' and mount it at /app/data\n"
+            f"    CLI: railway volume create bot_data\n"
+            f"         railway volume mount bot_data --service <id> --mount-path /app/data"
+        )
+        sys.exit(1)
+
+
 # ── Entry point ───────────────────────────────────────────────────────────────
 
 def main() -> None:
@@ -588,6 +615,7 @@ def main() -> None:
     log.info("=" * 60)
 
     validate_env()
+    probe_data_dir()
 
     log.info(f"  DRY_RUN       : {DRY_RUN}  {'← no posts will reach X' if DRY_RUN else '← LIVE posting enabled'}")
     log.info(f"  RECOVERY_MODE : {RECOVERY_MODE}  {'← replies/sniping disabled' if RECOVERY_MODE else '← full mode'}")

@@ -1,0 +1,20 @@
+# railway.toml — BugKSA worker service configuration
+# https://docs.railway.app/reference/config-as-code
+#
+# Volume (one-time setup — cannot be done via this file):
+#   railway volume create bot_data
+#   railway volume mount bot_data --service <worker-service-id> --mount-path /app/data
+#
+# Required env vars to set in Railway dashboard:
+#   OPENAI_API_KEY, X_API_KEY, X_API_SECRET, X_ACCESS_TOKEN, X_ACCESS_SECRET
+#
+# Optional env vars (defaults already coded in main.py):
+#   STATE_FILE_PATH   = /app/data/state.json
+#   PENDING_FILE_PATH = /app/data/pending.json
+#   DRY_RUN           = true
+#   RECOVERY_MODE     = true
+
+[deploy]
+startCommand    = "python main.py"
+numReplicas     = 1
+sleepApplication = false
