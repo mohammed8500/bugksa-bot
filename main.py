@@ -15,7 +15,7 @@ Optional (defaults shown):
   OPENAI_MODEL      – OpenAI model name            (default: gpt-5-mini)
   STATE_FILE_PATH   – Path to JSON state file      (default: /app/data/state.json)
   PENDING_FILE_PATH – Path to pending drafts file  (default: /app/data/pending.json)
-  DRY_RUN           – "true" → never post to X     (default: true)
+  DRY_RUN           – "true" → never post to X     (default: false)
   RECOVERY_MODE     – "true" → only status tweets  (default: true)
 
 Safe defaults for a previously-flagged account:
@@ -68,7 +68,7 @@ X_ACCESS_SECRET = _env("X_ACCESS_SECRET")
 OPENAI_MODEL      = _env("OPENAI_MODEL",      "gpt-5-mini")
 STATE_FILE_PATH   = Path(_env("STATE_FILE_PATH",   "/app/data/state.json"))
 PENDING_FILE_PATH = Path(_env("PENDING_FILE_PATH", "/app/data/pending.json"))
-DRY_RUN           = _flag("DRY_RUN",         default=True)
+DRY_RUN           = _flag("DRY_RUN",         default=False)
 RECOVERY_MODE     = _flag("RECOVERY_MODE",   default=True)
 
 # ── Rate-limit constants ──────────────────────────────────────────────────────
@@ -266,7 +266,7 @@ def generate_reply(ai: OpenAI, tweet_text: str, style_seed: str) -> str:
                 {"role": "user",   "content": user_msg},
             ],
             temperature=0.92,
-            max_tokens=90,
+            max_completion_tokens=90,
         )
         text = resp.choices[0].message.content.strip()
         return " ".join(text.splitlines()).strip()[:260]
@@ -298,7 +298,7 @@ def generate_recovery_tweet(ai: OpenAI) -> str:
             model=OPENAI_MODEL,
             messages=[{"role": "user", "content": prompt}],
             temperature=0.88,
-            max_tokens=80,
+            max_completion_tokens=80,
         )
         text = resp.choices[0].message.content.strip()
         return " ".join(text.splitlines()).strip()[:200]

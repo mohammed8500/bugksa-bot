@@ -11,7 +11,7 @@
 # Optional env vars (defaults already coded in main.py):
 #   STATE_FILE_PATH   = /app/data/state.json
 #   PENDING_FILE_PATH = /app/data/pending.json
-#   DRY_RUN           = true
+#   DRY_RUN           = false   # default; set to "true" to revert to draft-only mode
 #   RECOVERY_MODE     = true
 
 [deploy]
