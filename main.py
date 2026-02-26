@@ -209,11 +209,43 @@ def looks_generic(text: str) -> bool:
 
 
 def has_tech_metaphor(text: str) -> bool:
+    """Check 1 of 3: reply contains ≥1 tech keyword."""
     return any(w in text.lower() for w in _TECH_WORDS)
 
 
-def has_banter_energy(text: str) -> bool:
+# Arabic club names for jab detection (short + full forms)
+_AR_CLUB_NAMES: set[str] = {
+    "الهلال", "النصر", "الاتحاد", "الأهلي", "القادسية",
+    "الشباب", "الفيصلي", "التعاون", "الفتح", "الرائد",
+    # short / colloquial
+    "هلال", "نصر", "اتحاد", "أهلي",
+}
+
+
+def has_club_jab(text: str) -> bool:
+    """Check 2 of 3: reply targets a known club (English or Arabic).
+
+    Matches English club aliases, English banter tokens, or Arabic club names.
+    """
+    t = text.lower()
+    if any(alias in t for alias in _EN_CLUB_ALIASES):
+        return True
+    # Banter tokens by definition target a specific club
+    if any(token in t for token in _EN_BANTER_TOKENS_FLAT):
+        return True
+    # Arabic club names (case-sensitive Arabic, no lower() needed)
+    if any(name in text for name in _AR_CLUB_NAMES):
+        return True
+    return False
+
+
+def has_sarcasm_marker(text: str) -> bool:
+    """Check 3 of 3: reply contains a sarcasm / banter tone signal."""
     return any(s in text for s in _SARCASM_SIGNALS)
+
+
+# Keep has_banter_energy as an alias (used internally by fallback logic)
+has_banter_energy = has_sarcasm_marker
 
 
 def has_english_banter_token(text: str) -> bool:
@@ -242,23 +274,38 @@ def has_english_banter_token(text: str) -> bool:
 
 
 def quality_ok(text: str, lang_hint: str = "en") -> bool:
-    """Identity gate – all checks must pass, otherwise the reply is rejected.
+    """Identity gate: ≥2 of 3 core checks must pass, plus hard blocks.
 
-    Check 1: no generic/journalist phrasing
-    Check 2: contains a tech metaphor  (PART 2 of the 3-part structure)
-    Check 3: contains banter/sarcasm energy  (PART 3 tone)
-    Check 4: (English only) ≥1 club mock / banter token
+    Core checks (scored):
+      A. has_tech_metaphor  – tech vocabulary present       (PART 2)
+      B. has_club_jab       – text targets a known club     (PART 1)
+      C. has_sarcasm_marker – banter / sarcasm tone present (PART 3)
+    Threshold: score ≥ 2 required.
+
+    Hard blocks (enforced independently, override score):
+      – looks_generic          → journalist / neutral phrasing → always reject
+      – (English) has_english_banter_token → club mock token required
     """
     if not text or len(text.strip()) < 8:
         return False
+
+    # Hard block: generic / journalist phrasing
     if looks_generic(text):
         return False
-    if not has_tech_metaphor(text):
+
+    # Core score: ≥2 of 3
+    score = sum([
+        has_tech_metaphor(text),
+        has_club_jab(text),
+        has_sarcasm_marker(text),
+    ])
+    if score < 2:
         return False
-    if not has_banter_energy(text):
-        return False
+
+    # English-specific hard block: must also include a club mock token
     if lang_hint == "en" and not has_english_banter_token(text):
         return False
+
     return True
 
 
@@ -512,7 +559,15 @@ x = tweepy.Client(
 )
 
 
-def post_reply(state: dict, in_reply_to_tweet_id: int, text: str) -> None:
+def post_reply(state: dict, in_reply_to_tweet_id: int, text: str,
+               lang_hint: str = "en") -> None:
+    # Final quality gate – last line of defence before create_tweet
+    if not quality_ok(text, lang_hint):
+        log.warning(
+            "[BLOCKED] quality gate failed – reply suppressed "
+            "(score<2 or generic or no EN token) | %r", text[:80]
+        )
+        return
     if DRY_RUN:
         log.info(f"[DRY_RUN] Would reply to {in_reply_to_tweet_id}: {text}")
         record_action(state)
@@ -521,7 +576,14 @@ def post_reply(state: dict, in_reply_to_tweet_id: int, text: str) -> None:
     record_action(state)
 
 
-def post_tweet(state: dict, text: str) -> None:
+def post_tweet(state: dict, text: str, lang_hint: str = "ar") -> None:
+    # Final quality gate – last line of defence before create_tweet
+    if not quality_ok(text, lang_hint):
+        log.warning(
+            "[BLOCKED] quality gate failed – tweet suppressed "
+            "(score<2 or generic or no EN token) | %r", text[:80]
+        )
+        return
     if DRY_RUN:
         log.info(f"[DRY_RUN] Would tweet: {text}")
         record_action(state)
@@ -576,7 +638,7 @@ def run_recovery_mode(state: dict) -> None:
         return
 
     log.info(f"Recovery posting: {reply}")
-    post_tweet(state, reply)
+    post_tweet(state, reply, lang_hint="ar")
 
     silence_h = random.randint(*RECOVERY_SILENCE_H)
     log.info(f"Recovery: silence window {silence_h}h")
@@ -662,7 +724,7 @@ def monitor_mentions_and_snipes() -> None:
                         continue
 
                     log.info(f"Mention {tid}: replying → {reply}")
-                    post_reply(state, tw.id, reply)
+                    post_reply(state, tw.id, reply, lang_hint)
                     replied_set.add(tid)
                     state["replied_tweet_ids"].append(tid)
                     if derby:
@@ -729,7 +791,7 @@ def monitor_mentions_and_snipes() -> None:
                         continue
 
                     log.info(f"Snipe @{uname}: replying → {reply}")
-                    post_reply(state, tw.id, reply)
+                    post_reply(state, tw.id, reply, lang_hint)
                     replied_set.add(tid)
                     state["replied_tweet_ids"].append(tid)
                     if derby:
