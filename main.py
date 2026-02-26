@@ -1,311 +1,595 @@
-import os
-import time
-import random
+"""
+BugKSA – Saudi Football Sarcasm Bot
+====================================
+
+Railway Variables to set
+─────────────────────────
+Required:
+  OPENAI_API_KEY    – OpenAI secret key
+  X_API_KEY         – Twitter/X consumer key
+  X_API_SECRET      – Twitter/X consumer secret
+  X_ACCESS_TOKEN    – Twitter/X access token
+  X_ACCESS_SECRET   – Twitter/X access token secret
+
+Optional (defaults shown):
+  OPENAI_MODEL      – OpenAI model name          (default: gpt-5-mini)
+  STATE_FILE_PATH   – Path to JSON state file    (default: ./state.json)
+  DRY_RUN           – "true" → never post        (default: true)
+  RECOVERY_MODE     – "true" → only status tweets (default: true)
+
+Recovery mode is the safe default for previously-flagged accounts.
+Set RECOVERY_MODE=false and DRY_RUN=false only when ready to go live.
+"""
+
 import json
+import logging
+import os
+import random
+import re
+import sys
+import time
+from pathlib import Path
+
 import tweepy
 from openai import OpenAI
 
-# =========================
-# 1) المفاتيح: Railway (ENV) أو يدوي للجوال/Colab
-# =========================
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
-X_API_KEY = os.getenv("X_API_KEY", "")
-X_API_SECRET = os.getenv("X_API_SECRET", "")
-X_ACCESS_TOKEN = os.getenv("X_ACCESS_TOKEN", "")
-X_ACCESS_SECRET = os.getenv("X_ACCESS_SECRET", "")
-
-# لو بتشغله على الجوال/Colab بدون Variables:
-# حط مفاتيحك بين الاقتباسات هنا (واترك اللي فوق مثل ما هو)
-if not OPENAI_API_KEY:
-    OPENAI_API_KEY = ""
-if not X_API_KEY:
-    X_API_KEY = ""
-if not X_API_SECRET:
-    X_API_SECRET = ""
-if not X_ACCESS_TOKEN:
-    X_ACCESS_TOKEN = ""
-if not X_ACCESS_SECRET:
-    X_ACCESS_SECRET = ""
-
-def _clean(s: str) -> str:
-    return (s or "").strip().replace("\r", "").replace("\n", "")
-
-OPENAI_API_KEY  = _clean(OPENAI_API_KEY)
-X_API_KEY       = _clean(X_API_KEY)
-X_API_SECRET    = _clean(X_API_SECRET)
-X_ACCESS_TOKEN  = _clean(X_ACCESS_TOKEN)
-X_ACCESS_SECRET = _clean(X_ACCESS_SECRET)
-
-if not all([OPENAI_API_KEY, X_API_KEY, X_API_SECRET, X_ACCESS_TOKEN, X_ACCESS_SECRET]):
-    raise RuntimeError("❌ ناقص مفاتيح: تأكد حاطها في Railway Variables أو بين الاقتباسات داخل main.py")
-
-# =========================
-# 2) إعداد OpenAI + X
-# =========================
-ai = OpenAI(api_key=OPENAI_API_KEY)
-
-# Tweepy v2 Client (OAuth 1.0a user context)
-client = tweepy.Client(
-    consumer_key=X_API_KEY,
-    consumer_secret=X_API_SECRET,
-    access_token=X_ACCESS_TOKEN,
-    access_token_secret=X_ACCESS_SECRET,
-    wait_on_rate_limit=True,
+# ── Logging ───────────────────────────────────────────────────────────────────
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s  %(levelname)-7s  %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S",
 )
+log = logging.getLogger("bugksa")
 
-# =========================
-# 3) الإعدادات (أندية + حسابات عالمية)
-# =========================
-SAUDI_CLUBS = [
-    "Alhilal_FC",
-    "ALAHLI_FC",
-    "ittihad",
-    "AlNassrFC",
+# ── Env helpers ───────────────────────────────────────────────────────────────
+
+def _env(key: str, default: str = "") -> str:
+    return os.environ.get(key, default).strip()
+
+
+def _flag(key: str, default: bool = True) -> bool:
+    """Read a boolean env var. Absent → default."""
+    raw = os.environ.get(key)
+    if raw is None:
+        return default
+    return raw.strip().lower() not in ("0", "false", "no", "off")
+
+
+# ── Config ────────────────────────────────────────────────────────────────────
+OPENAI_API_KEY  = _env("OPENAI_API_KEY")
+X_API_KEY       = _env("X_API_KEY")
+X_API_SECRET    = _env("X_API_SECRET")
+X_ACCESS_TOKEN  = _env("X_ACCESS_TOKEN")
+X_ACCESS_SECRET = _env("X_ACCESS_SECRET")
+
+OPENAI_MODEL    = _env("OPENAI_MODEL", "gpt-5-mini")
+STATE_FILE_PATH = Path(_env("STATE_FILE_PATH", "./state.json"))
+DRY_RUN         = _flag("DRY_RUN",        default=True)
+RECOVERY_MODE   = _flag("RECOVERY_MODE",  default=True)
+
+# ── Rate-limit constants ──────────────────────────────────────────────────────
+RATE_MIN_GAP  = 600   # ≥10 minutes between any two actions
+RATE_MAX_HOUR = 6     # rolling 60-minute cap
+RATE_MAX_DAY  = 25    # rolling 24-hour cap
+
+# Recovery-mode constants (posted-flagged-account rehabilitation)
+RECOVERY_MAX_DAY = 3     # original status tweets per day
+RECOVERY_MIN_GAP = 7200  # ≥2 hours between recovery tweets
+
+# ── Target club accounts ──────────────────────────────────────────────────────
+TARGET_USERNAMES: list[str] = [
+    "Alhilal_FC", "ALAHLI_FC", "ittihad", "AlNassrFC",
+    "realmadrid", "FCBarcelona", "ManCity", "LFC",
 ]
 
-GLOBAL_CLUBS = [
-    "realmadrid",
-    "FCBarcelona",
-    "ManCity",
-    "LFC",
-]
+# ── Env validation ────────────────────────────────────────────────────────────
 
-TARGET_USERNAMES = list(dict.fromkeys(SAUDI_CLUBS + GLOBAL_CLUBS))
+def validate_env() -> None:
+    required = {
+        "OPENAI_API_KEY":  OPENAI_API_KEY,
+        "X_API_KEY":       X_API_KEY,
+        "X_API_SECRET":    X_API_SECRET,
+        "X_ACCESS_TOKEN":  X_ACCESS_TOKEN,
+        "X_ACCESS_SECRET": X_ACCESS_SECRET,
+    }
+    log.info("Checking env vars …")
+    for key, val in required.items():
+        if val:
+            masked = ("*" * max(0, len(val) - 4)) + val[-4:]
+        else:
+            masked = "(MISSING)"
+        log.info(f"  {key}: {masked}")
 
-# =========================
-# 4) حدود التكرار (Rate Limits)
-# =========================
-# Minimum seconds between any two actions (10 minutes)
-RATE_MIN_GAP_SECONDS = 600
-# Maximum actions allowed within a rolling 60-minute window
-RATE_MAX_PER_HOUR = 6
-# Maximum actions allowed within a rolling 24-hour window
-RATE_MAX_PER_DAY = 25
+    missing = [k for k, v in required.items() if not v]
+    if missing:
+        log.error(f"Missing required env vars: {', '.join(missing)}")
+        sys.exit(1)
 
+
+# ── Persistent state ──────────────────────────────────────────────────────────
+
+def load_state() -> dict:
+    try:
+        with open(STATE_FILE_PATH, "r", encoding="utf-8") as f:
+            s = json.load(f)
+    except Exception:
+        s = {}
+    # Backwards-compatible defaults
+    s.setdefault("last_mention_id",     None)
+    s.setdefault("last_seen_by_target", {})   # {username: last_tweet_id}
+    s.setdefault("replied_tweet_ids",   [])   # dedupe set, trimmed to 500
+    s.setdefault("actions_log",         [])   # Unix timestamps of all actions
+    s.setdefault("target_last_acted",   {})   # {username: Unix timestamp}
+    s.setdefault("recovery_tweets_log", [])   # timestamps for recovery tweets
+    return s
+
+
+def save_state(state: dict) -> None:
+    STATE_FILE_PATH.parent.mkdir(parents=True, exist_ok=True)
+    now = time.time()
+    state["replied_tweet_ids"]   = state.get("replied_tweet_ids",   [])[-500:]
+    state["actions_log"]         = [t for t in state.get("actions_log",         []) if now - t < 86400]
+    state["recovery_tweets_log"] = [t for t in state.get("recovery_tweets_log", []) if now - t < 86400]
+    with open(STATE_FILE_PATH, "w", encoding="utf-8") as f:
+        json.dump(state, f, ensure_ascii=False, indent=2)
+
+
+# ── Global Safety Governor ────────────────────────────────────────────────────
 
 def can_act(state: dict) -> bool:
-    """Return True only if all three rate-limit constraints are satisfied.
+    """Return True only when ALL three rate-limit constraints are satisfied.
 
-    Constraints enforced:
-      1. At least RATE_MIN_GAP_SECONDS (10 min) since the last action.
-      2. Fewer than RATE_MAX_PER_HOUR (6) actions in the past 60 minutes.
-      3. Fewer than RATE_MAX_PER_DAY (25) actions in the past 24 hours.
+    Constraints:
+      1. now - actions_log[-1] >= RATE_MIN_GAP  (≥10 min gap)
+      2. count(actions in last 3600s) < RATE_MAX_HOUR  (6/hr)
+      3. count(actions in last 86400s) < RATE_MAX_DAY  (25/day)
     """
     now = time.time()
-    log: list = state.get("actions_log", [])
+    log_ts: list[float] = [t for t in state.get("actions_log", []) if now - t < 86400]
+    state["actions_log"] = log_ts  # prune in-memory copy
 
-    # Prune entries older than 24 hours (keep state file small)
-    log = [t for t in log if now - t < 86400]
-    state["actions_log"] = log
-
-    # --- Constraint 1: minimum gap between actions ---
-    if log:
-        seconds_since_last = now - log[-1]
-        if seconds_since_last < RATE_MIN_GAP_SECONDS:
-            print(
-                f"🚫 Rate limit: {seconds_since_last:.0f}s since last action "
-                f"(min {RATE_MIN_GAP_SECONDS}s / 10 min required)"
-            )
+    # 1. Minimum gap
+    if log_ts:
+        gap = now - log_ts[-1]
+        if gap < RATE_MIN_GAP:
+            log.info(f"Governor: gap {gap:.0f}s < {RATE_MIN_GAP}s – skip")
             return False
 
-    # --- Constraint 2: max 6 per rolling hour ---
-    last_hour = [t for t in log if now - t < 3600]
-    if len(last_hour) >= RATE_MAX_PER_HOUR:
-        print(f"🚫 Rate limit: hourly cap reached ({RATE_MAX_PER_HOUR} actions/hr)")
+    # 2. Hourly cap
+    hour_count = sum(1 for t in log_ts if now - t < 3600)
+    if hour_count >= RATE_MAX_HOUR:
+        log.info(f"Governor: hourly cap {hour_count}/{RATE_MAX_HOUR} – skip")
         return False
 
-    # --- Constraint 3: max 25 per rolling day ---
-    if len(log) >= RATE_MAX_PER_DAY:
-        print(f"🚫 Rate limit: daily cap reached ({RATE_MAX_PER_DAY} actions/day)")
+    # 3. Daily cap
+    if len(log_ts) >= RATE_MAX_DAY:
+        log.info(f"Governor: daily cap {len(log_ts)}/{RATE_MAX_DAY} – skip")
         return False
 
     return True
 
 
 def record_action(state: dict) -> None:
-    """Append the current timestamp to the actions log."""
+    """Append current timestamp and immediately flush state to disk."""
     state.setdefault("actions_log", []).append(time.time())
+    save_state(state)
 
 
-# =========================
-# 5) منع التكرار (ذاكرة بسيطة + ملف)
-# =========================
-STATE_FILE = "state.json"
+# ── API clients ───────────────────────────────────────────────────────────────
+
+def build_clients() -> tuple:
+    ai = OpenAI(api_key=OPENAI_API_KEY)
+    client = tweepy.Client(
+        consumer_key=X_API_KEY,
+        consumer_secret=X_API_SECRET,
+        access_token=X_ACCESS_TOKEN,
+        access_token_secret=X_ACCESS_SECRET,
+        wait_on_rate_limit=True,
+    )
+    return ai, client
 
 
-def load_state() -> dict:
-    try:
-        with open(STATE_FILE, "r", encoding="utf-8") as f:
-            s = json.load(f)
-    except Exception:
-        s = {}
-    # Ensure all keys exist (backwards-compatible with old state files)
-    s.setdefault("last_mention_id", None)
-    s.setdefault("last_seen_by_user", {})
-    s.setdefault("replied_tweet_ids", [])
-    s.setdefault("actions_log", [])   # list of Unix timestamps for rate limiting
-    return s
+# ── AI reply generation ───────────────────────────────────────────────────────
 
-
-def save_state(state: dict) -> None:
-    try:
-        # Trim replied list to last 500 IDs to keep the file small
-        state["replied_tweet_ids"] = state.get("replied_tweet_ids", [])[-500:]
-        with open(STATE_FILE, "w", encoding="utf-8") as f:
-            json.dump(state, f, ensure_ascii=False, indent=2)
-    except Exception:
-        pass
-
-
-state = load_state()
-replied_set: set = set(state.get("replied_tweet_ids", []))
-
-# =========================
-# 6) توليد ردود ساخرة متنوعة (80% كورة / 20% تقني)
-# =========================
-ROAST_VARIANTS = [
-    "You are @BugKSA: sarcastic football fan. 80% football, 20% tech. One-liner only. Avoid repeating the same tech joke (no constant 404).",
-    "You are @BugKSA: witty Saudi football fan. 80% football banter, 20% geek references. One-liner. Use varied metaphors (lag, patch, ping, update, cache, timeout, hotfix).",
-    "You are @BugKSA: sharp football troll but not hateful. 80% football, 20% tech. One-liner. Keep it fresh and short.",
+_STYLE_SEEDS: list[str] = [
+    "cache miss", "404 offside", "timeout", "ping spike", "hotfix",
+    "memory leak", "rollback", "null pointer", "stack overflow",
+    "server down", "patch update", "debug mode", "laggy VAR",
+    "cpu overload", "latency issue", "infinite loop", "merge conflict",
+    "rate limited", "buffer overflow", "garbage collected",
 ]
 
-
-def generate_reply(tweet_text: str) -> str:
-    prompt = f"""
-{random.choice(ROAST_VARIANTS)}
+_SYSTEM_PROMPT = """\
+You are @BugKSA: a Saudi football sarcasm bot with light tech humor.
 
 Rules:
-1) Detect the language of the tweet (Arabic/English/Spanish/etc).
-2) Reply in the SAME language.
-3) Be short: one line.
-4) No insults on race/religion, no harassment. Just football sarcasm.
+- Style ratio: 80% football banter, 20% tech joke
+- Output: exactly ONE line, ≤260 characters
+- Language: detect the language of the input tweet; reply in the SAME language \
+(Arabic → Arabic, English → English, Spanish → Spanish, etc.)
+- Always end with a tiny football or tech observation (one short clause)
+- Use the given style seed to vary your punchline each time; do not repeat
+- FORBIDDEN: politics, religion, hate, harassment, doxxing, personal attacks
+- Joke about teams/situations only – never about individuals personally
+- If the source tweet is sensitive or ambiguous, give a safe evasive football joke
+"""
 
-Tweet:
-{tweet_text}
-""".strip()
 
+def generate_reply(ai: OpenAI, tweet_text: str, style_seed: str) -> str:
+    user_msg = f"Style seed: '{style_seed}'\n\nTweet:\n{tweet_text}"
     try:
         resp = ai.chat.completions.create(
-            model="gpt-4o-mini",
+            model=OPENAI_MODEL,
+            messages=[
+                {"role": "system", "content": _SYSTEM_PROMPT},
+                {"role": "user",   "content": user_msg},
+            ],
+            temperature=0.92,
+            max_tokens=90,
+        )
+        text = resp.choices[0].message.content.strip()
+        return " ".join(text.splitlines()).strip()[:260]
+    except Exception as e:
+        log.warning(f"OpenAI generate_reply error: {e}")
+        return "VAR under review… system timeout. ⚽🤖"
+
+
+def generate_recovery_tweet(ai: OpenAI) -> str:
+    """Harmless human-like football status update for recovery mode.
+    No links, no hashtags, no mentions."""
+    topics = [
+        "watching a match tonight",
+        "thinking about last night's game",
+        "impressive football statistics",
+        "waiting for the weekend fixtures",
+        "a classic goal I still remember",
+        "how tactics have changed in modern football",
+        "that feeling when your team scores late",
+    ]
+    prompt = (
+        f"Write a single casual, human-sounding football status tweet about: "
+        f"{random.choice(topics)}. "
+        "Rules: no links, no hashtags, no @mentions, max 200 characters, "
+        "sound like a genuine football fan, one sentence only."
+    )
+    try:
+        resp = ai.chat.completions.create(
+            model=OPENAI_MODEL,
             messages=[{"role": "user", "content": prompt}],
-            temperature=0.9,
+            temperature=0.88,
             max_tokens=80,
         )
         text = resp.choices[0].message.content.strip()
-        return " ".join(text.splitlines()).strip()[:280]
-    except Exception:
-        return "System lag… even VAR crashed. 🤖⚽"
+        return " ".join(text.splitlines()).strip()[:200]
+    except Exception as e:
+        log.warning(f"OpenAI generate_recovery_tweet error: {e}")
+        return "Football: where logic goes to retire. ⚽"
 
 
-# =========================
-# 7) أدوات: جلب ID من اليوزر
-# =========================
-def get_user_id(username: str) -> str:
-    r = client.get_user(username=username, user_auth=True)
-    if not r or not r.data:
-        raise RuntimeError(f"❌ ما قدرت أجيب ID لليوزر: {username}")
-    return str(r.data.id)
+# ── Tweet eligibility filter ──────────────────────────────────────────────────
+
+_LINK_RE    = re.compile(r"https?://\S+|t\.co/\S+", re.IGNORECASE)
+_MENTION_RE = re.compile(r"@\w+")
 
 
-def safe_create_reply(text: str, in_reply_to_tweet_id: str):
-    text = (text or "").strip()
-    if not text:
-        return None
-    if len(text) > 280:
-        text = text[:277] + "..."
-    return client.create_tweet(
-        text=text,
-        in_reply_to_tweet_id=in_reply_to_tweet_id,
-        user_auth=True,
-    )
+def is_eligible_club_tweet(tweet) -> tuple[bool, str]:
+    """Return (eligible, reason_if_rejected).
+
+    Rejects:
+      - Retweets (text prefix or referenced_tweets type)
+      - Quote tweets (referenced_tweets type)
+      - Tweets containing any URL/link
+      - Tweets shorter than 8 characters (after stripping links)
+      - Tweets with 3 or more @mentions
+    """
+    text: str = tweet.text or ""
+
+    # Retweet (text-level)
+    if text.startswith("RT "):
+        return False, "retweet prefix"
+
+    # Quote tweet or retweet via referenced_tweets API field
+    refs = getattr(tweet, "referenced_tweets", None)
+    if refs:
+        for ref in refs:
+            ref_type = getattr(ref, "type", "")
+            if ref_type in ("quoted", "retweeted"):
+                return False, f"referenced_tweet type={ref_type}"
+
+    # Any link → skip (likely ad or self-promo)
+    if _LINK_RE.search(text):
+        return False, "contains link/url"
+
+    # Too short
+    clean = _LINK_RE.sub("", text).strip()
+    if len(clean) < 8:
+        return False, f"too short ({len(clean)} chars)"
+
+    # 3+ @mentions → likely a thread reply / ad
+    if len(_MENTION_RE.findall(text)) >= 3:
+        return False, f"too many mentions ({len(_MENTION_RE.findall(text))})"
+
+    return True, ""
 
 
-# =========================
-# 8) تشغيل البوت
-# =========================
-def run_bot():
+# ── Post wrappers ─────────────────────────────────────────────────────────────
+
+def post_reply(
+    client: tweepy.Client, text: str, reply_to_id: str, state: dict
+) -> bool:
+    if DRY_RUN:
+        log.info(f"[DRY_RUN] Would reply to {reply_to_id}: {text!r}")
+        record_action(state)
+        return True
+    try:
+        client.create_tweet(text=text, in_reply_to_tweet_id=reply_to_id, user_auth=True)
+        record_action(state)
+        log.info(f"✅ Replied to {reply_to_id}: {text!r}")
+        return True
+    except Exception as e:
+        log.error(f"create_tweet (reply) failed: {e}")
+        return False
+
+
+def post_tweet(client: tweepy.Client, text: str, state: dict) -> bool:
+    if DRY_RUN:
+        log.info(f"[DRY_RUN] Would post: {text!r}")
+        record_action(state)
+        return True
+    try:
+        client.create_tweet(text=text, user_auth=True)
+        record_action(state)
+        log.info(f"✅ Tweeted: {text!r}")
+        return True
+    except Exception as e:
+        log.error(f"create_tweet (status) failed: {e}")
+        return False
+
+
+# ── Bot identity & target resolution ─────────────────────────────────────────
+
+def get_bot_identity(client: tweepy.Client) -> tuple[str, str]:
     me = client.get_me(user_auth=True)
-    my_id = str(me.data.id)
-    print(f"✅ Logged in as: @{me.data.username} (ID: {my_id})")
-    print(
-        f"⚙️  Rate limits: min {RATE_MIN_GAP_SECONDS}s between actions, "
-        f"max {RATE_MAX_PER_HOUR}/hr, max {RATE_MAX_PER_DAY}/day"
-    )
+    return str(me.data.id), str(me.data.username)
 
-    # جهّز IDs للحسابات المستهدفة
-    target_ids = []
-    for u in TARGET_USERNAMES:
+
+def resolve_target_ids(
+    client: tweepy.Client, usernames: list[str]
+) -> dict[str, str]:
+    """Return {username: user_id}. Logs but does not abort on failures."""
+    result: dict[str, str] = {}
+    for username in usernames:
         try:
-            uid = get_user_id(u)
-            target_ids.append(uid)
-            state["last_seen_by_user"].setdefault(uid, None)
+            r = client.get_user(username=username, user_auth=True)
+            if r and r.data:
+                result[username] = str(r.data.id)
+                log.info(f"  @{username} → id={r.data.id}")
         except Exception as e:
-            print(f"⚠️ تخطيت {u}: {e}")
+            log.warning(f"  @{username}: resolve failed – {e}")
+    return result
 
-    # حلقة رئيسية
-    while True:
-        try:
-            # 1) الرد على المنشنز
-            mentions = client.get_users_mentions(
-                id=my_id,
-                since_id=state.get("last_mention_id"),
-                user_auth=True,
-                max_results=20,
-            )
 
-            if mentions and mentions.data:
-                state["last_mention_id"] = mentions.meta.get(
-                    "newest_id", state.get("last_mention_id")
-                )
-                for tw in mentions.data:
-                    tid = str(tw.id)
-                    if tid in replied_set:
-                        continue
-                    if not can_act(state):
-                        break   # stop processing until next cycle
-                    reply = generate_reply(tw.text)
-                    safe_create_reply(reply, tid)
-                    record_action(state)
-                    replied_set.add(tid)
-                    state["replied_tweet_ids"].append(tid)
-                    print(f"📩 Mention reply -> {reply}")
+# ── Mentions mode ─────────────────────────────────────────────────────────────
 
-            # 2) قنص حسابات الأندية (آخر تغريداتهم)
-            for uid in target_ids:
-                since_id = state["last_seen_by_user"].get(uid)
-                tweets = client.get_users_tweets(
-                    id=uid,
-                    since_id=since_id,
-                    user_auth=True,
-                    max_results=5,
-                    exclude=["retweets", "replies"],
-                )
-                if tweets and tweets.data:
-                    state["last_seen_by_user"][uid] = tweets.meta.get(
-                        "newest_id", since_id
-                    )
-                    for tw in tweets.data:
-                        tid = str(tw.id)
-                        if tid in replied_set:
-                            continue
-                        if not can_act(state):
-                            break   # stop processing until next cycle
-                        reply = generate_reply(tw.text)
-                        safe_create_reply(reply, tid)
-                        record_action(state)
-                        replied_set.add(tid)
-                        state["replied_tweet_ids"].append(tid)
-                        print(f"🎯 Club snipe -> {reply}")
+def run_mentions_mode(
+    client: tweepy.Client, ai: OpenAI, my_id: str, state: dict
+) -> bool:
+    """Process at most 1 mention per cycle. Returns True if an action was taken."""
+    replied_set = set(state.get("replied_tweet_ids", []))
 
+    try:
+        resp = client.get_users_mentions(
+            id=my_id,
+            since_id=state.get("last_mention_id"),
+            user_auth=True,
+            max_results=10,
+            tweet_fields=["id", "text", "author_id"],
+        )
+    except Exception as e:
+        log.warning(f"Mentions fetch error: {e}")
+        return False
+
+    if not resp or not resp.data:
+        log.info("Mentions: none new")
+        return False
+
+    # Always advance the cursor so old mentions are not reprocessed after restart
+    if resp.meta and resp.meta.get("newest_id"):
+        state["last_mention_id"] = resp.meta["newest_id"]
+
+    # Process at most 1 per cycle
+    for item in resp.data[:1]:
+        tid = str(item.id)
+        if tid in replied_set:
+            log.info(f"Mention {tid}: already replied – skip")
+            continue
+
+        if not can_act(state):
+            return False
+
+        seed = random.choice(_STYLE_SEEDS)
+        reply = generate_reply(ai, item.text, seed)
+        log.info(f"Mention {tid}: replying (seed={seed!r})")
+        if post_reply(client, reply, tid, state):
+            replied_set.add(tid)
+            state["replied_tweet_ids"] = list(replied_set)
             save_state(state)
+            return True
 
-            # نام 120-180 ثانية قبل الدورة القادمة
-            time.sleep(120 + random.randint(0, 60))
+    return False
 
+
+# ── Sniping mode ──────────────────────────────────────────────────────────────
+
+def run_sniping_mode(
+    client: tweepy.Client,
+    ai: OpenAI,
+    target_ids: dict[str, str],
+    state: dict,
+) -> bool:
+    """Try to reply to ONE eligible tweet from ONE target per cycle.
+    Returns True if an action was taken."""
+    replied_set = set(state.get("replied_tweet_ids", []))
+    now = time.time()
+
+    targets = list(target_ids.items())
+    random.shuffle(targets)  # avoid always hitting the same account first
+
+    for username, uid in targets:
+        # Per-target 24-hour cooldown
+        last_acted = state.get("target_last_acted", {}).get(username, 0.0)
+        if now - last_acted < 86400:
+            remaining_h = (86400 - (now - last_acted)) / 3600
+            log.info(f"Snipe @{username}: cooldown {remaining_h:.1f}h remaining – skip")
+            continue
+
+        since_id = state.get("last_seen_by_target", {}).get(username)
+        try:
+            result = client.get_users_tweets(
+                id=uid,
+                since_id=since_id,
+                user_auth=True,
+                max_results=5,
+                exclude=["retweets", "replies"],
+                tweet_fields=["id", "text", "referenced_tweets"],
+            )
         except Exception as e:
-            print(f"⚠️ Error: {e}")
-            time.sleep(60)
+            log.warning(f"Snipe @{username}: fetch error – {e}")
+            continue
+
+        if not result or not result.data:
+            log.info(f"Snipe @{username}: no new tweets")
+            continue
+
+        # Advance cursor for this target
+        if result.meta and result.meta.get("newest_id"):
+            state.setdefault("last_seen_by_target", {})[username] = result.meta["newest_id"]
+
+        for tweet in result.data:
+            tid = str(tweet.id)
+            if tid in replied_set:
+                log.info(f"Snipe @{username} {tid}: already replied – skip")
+                continue
+
+            eligible, reason = is_eligible_club_tweet(tweet)
+            if not eligible:
+                log.info(f"Snipe @{username} {tid}: ineligible ({reason})")
+                continue
+
+            if not can_act(state):
+                return False
+
+            seed = random.choice(_STYLE_SEEDS)
+            reply = generate_reply(ai, tweet.text, seed)
+            log.info(f"Snipe @{username} {tid}: replying (seed={seed!r})")
+            if post_reply(client, reply, tid, state):
+                replied_set.add(tid)
+                state["replied_tweet_ids"] = list(replied_set)
+                state.setdefault("target_last_acted", {})[username] = now
+                save_state(state)
+                return True  # one action per cycle; stop here
+
+    return False
+
+
+# ── Recovery mode ─────────────────────────────────────────────────────────────
+
+def run_recovery_mode(client: tweepy.Client, ai: OpenAI, state: dict) -> bool:
+    """Post one harmless status tweet when within recovery limits.
+    Replies are completely disabled in recovery mode.
+    Returns True if an action was taken."""
+    now = time.time()
+    rec_log: list[float] = [
+        t for t in state.get("recovery_tweets_log", []) if now - t < 86400
+    ]
+    state["recovery_tweets_log"] = rec_log
+
+    # Recovery daily cap
+    if len(rec_log) >= RECOVERY_MAX_DAY:
+        log.info(f"Recovery: daily cap {len(rec_log)}/{RECOVERY_MAX_DAY} – skip")
+        return False
+
+    # Recovery minimum gap (2 hours)
+    if rec_log:
+        gap = now - rec_log[-1]
+        if gap < RECOVERY_MIN_GAP:
+            log.info(f"Recovery: gap {gap/3600:.1f}h < {RECOVERY_MIN_GAP/3600:.0f}h – skip")
+            return False
+
+    # Global governor also applies
+    if not can_act(state):
+        return False
+
+    text = generate_recovery_tweet(ai)
+    log.info("Recovery: posting harmless status tweet")
+    if post_tweet(client, text, state):
+        state["recovery_tweets_log"].append(now)
+        save_state(state)
+        return True
+
+    return False
+
+
+# ── Entry point ───────────────────────────────────────────────────────────────
+
+def main() -> None:
+    log.info("=" * 60)
+    log.info("BugKSA Bot – Starting up")
+    log.info("=" * 60)
+
+    validate_env()
+
+    log.info(f"  DRY_RUN       : {DRY_RUN}")
+    log.info(f"  RECOVERY_MODE : {RECOVERY_MODE}")
+    log.info(f"  OPENAI_MODEL  : {OPENAI_MODEL}")
+    log.info(f"  STATE_FILE    : {STATE_FILE_PATH}")
+    log.info(f"  Rate limits   : gap≥{RATE_MIN_GAP}s | {RATE_MAX_HOUR}/hr | {RATE_MAX_DAY}/day")
+    log.info(f"  Targets       : {len(TARGET_USERNAMES)} club accounts")
+
+    ai, client = build_clients()
+    state = load_state()
+
+    try:
+        my_id, my_username = get_bot_identity(client)
+        log.info(f"  Bot identity  : @{my_username} (id={my_id})")
+    except Exception as e:
+        log.error(f"Twitter authentication failed: {e}")
+        sys.exit(1)
+
+    target_ids: dict[str, str] = {}
+    if not RECOVERY_MODE:
+        log.info("Resolving target account IDs …")
+        target_ids = resolve_target_ids(client, TARGET_USERNAMES)
+        log.info(f"Resolved {len(target_ids)}/{len(TARGET_USERNAMES)} targets.")
+
+    log.info("=" * 60)
+    log.info("Poll loop starting …")
+
+    cycle = 0
+    while True:
+        cycle += 1
+        log.info(f"── Cycle {cycle} " + "─" * 40)
+
+        acted = False
+
+        if RECOVERY_MODE:
+            # Replies disabled; only harmless status tweets
+            acted = run_recovery_mode(client, ai, state)
+        else:
+            # Normal mode: mentions first, then sniping
+            acted = run_mentions_mode(client, ai, my_id, state)
+            if not acted:
+                acted = run_sniping_mode(client, ai, target_ids, state)
+
+        if not acted:
+            log.info("Cycle complete: no action taken.")
+
+        save_state(state)
+
+        sleep_s = random.randint(120, 300)  # 2–5 minutes
+        log.info(f"Sleeping {sleep_s}s …")
+        time.sleep(sleep_s)
 
 
 if __name__ == "__main__":
-    run_bot()
+    main()
