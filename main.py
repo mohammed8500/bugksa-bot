@@ -12,7 +12,7 @@ Required:
   X_ACCESS_SECRET   – Twitter/X access token secret
 
 Optional (defaults shown):
-  OPENAI_MODEL      – OpenAI model name            (default: gpt-5-mini)
+  OPENAI_MODEL      – OpenAI model name            (default: gpt-4o-mini)
   STATE_FILE_PATH   – Path to JSON state file      (default: /app/data/state.json)
   PENDING_FILE_PATH – Path to pending drafts file  (default: /app/data/pending.json)
   DRY_RUN           – "true" → never post to X     (default: false)
@@ -65,7 +65,7 @@ X_API_SECRET    = _env("X_API_SECRET")
 X_ACCESS_TOKEN  = _env("X_ACCESS_TOKEN")
 X_ACCESS_SECRET = _env("X_ACCESS_SECRET")
 
-OPENAI_MODEL      = _env("OPENAI_MODEL",      "gpt-5-mini")
+OPENAI_MODEL      = _env("OPENAI_MODEL",      "gpt-4o-mini")
 STATE_FILE_PATH   = Path(_env("STATE_FILE_PATH",   "/app/data/state.json"))
 PENDING_FILE_PATH = Path(_env("PENDING_FILE_PATH", "/app/data/pending.json"))
 DRY_RUN           = _flag("DRY_RUN",         default=False)
