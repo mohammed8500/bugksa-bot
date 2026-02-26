@@ -1,0 +1,15 @@
+# Runtime state — persisted on the Railway Volume at /app/data/, never in the repo
+state.json
+pending.json
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.env
+.venv/
+venv/
+
+# Editor/OS artefacts
+.DS_Store
+*.swp
