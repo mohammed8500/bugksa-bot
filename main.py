@@ -71,10 +71,19 @@ PENDING_FILE_PATH = Path(_env("PENDING_FILE_PATH", "/app/data/pending.json"))
 DRY_RUN           = _flag("DRY_RUN",         default=False)
 RECOVERY_MODE     = _flag("RECOVERY_MODE",   default=True)
 
-# ── Rate-limit constants ──────────────────────────────────────────────────────
-RATE_MIN_GAP  = 45    # ≥45 seconds between any two actions
-RATE_MAX_HOUR = 10    # rolling 60-minute cap (≤10–12/hr per spec)
-RATE_MAX_DAY  = 100   # rolling 24-hour cap
+# ── Rate-limit constants (CRITICAL ANTI-SPAM GOVERNOR – never override) ───────
+RATE_MIN_GAP     = 600   # ≥10 min between any two actions
+RATE_MAX_HOUR    = 6     # rolling 60-min cap
+RATE_MAX_DAY     = 25    # rolling 24-hour cap
+
+# Burst guard: no more than 3 posts in any 30-minute window
+RATE_MAX_BURST   = 3
+RATE_BURST_WIN   = 1800  # 30 minutes
+
+# Humanization: skip ~40 % of opportunities and add 5–15 min extra gap
+HUMANIZE_SKIP_RATE  = 0.40
+HUMANIZE_EXTRA_LOW  = 300   # 5 min
+HUMANIZE_EXTRA_HIGH = 900   # 15 min
 
 # Recovery-mode constants (posted-flagged-account rehabilitation)
 RECOVERY_MAX_DAY = 3     # original status tweets per day
@@ -254,6 +263,7 @@ def load_state() -> dict:
     s.setdefault("actions_log",         [])   # Unix timestamps of all actions
     s.setdefault("target_last_acted",   {})   # {username: Unix timestamp}
     s.setdefault("recovery_tweets_log", [])   # timestamps for recovery tweets
+    s.setdefault("next_action_after",   0.0)  # humanized gate: earliest next post
     return s
 
 
@@ -307,31 +317,47 @@ def save_pending_draft(text: str, draft_type: str = "recovery") -> None:
 # ── Global Safety Governor ────────────────────────────────────────────────────
 
 def can_act(state: dict) -> bool:
-    """Return True only when ALL three rate-limit constraints are satisfied.
+    """Return True only when ALL rate-limit constraints are satisfied.
 
-    Constraints:
-      1. now - actions_log[-1] >= RATE_MIN_GAP  (≥45 s gap)
-      2. count(actions in last 3600s) < RATE_MAX_HOUR  (10/hr)
-      3. count(actions in last 86400s) < RATE_MAX_DAY  (100/day)
+    Constraints (in evaluation order):
+      1. now >= state["next_action_after"]  (humanized extra gap, set after each post)
+      2. now - actions_log[-1] >= RATE_MIN_GAP  (≥10 min hard gap)
+      3. count(actions in last 1800s) < RATE_MAX_BURST  (≤3 in 30 min)
+      4. count(actions in last 3600s) < RATE_MAX_HOUR  (6/hr)
+      5. count(actions in last 86400s) < RATE_MAX_DAY  (25/day)
+    All constraints are HARD limits and cannot be bypassed.
     """
     now = time.time()
     log_ts: list[float] = [t for t in state.get("actions_log", []) if now - t < 86400]
     state["actions_log"] = log_ts  # prune in-memory copy
 
-    # 1. Minimum gap
+    # 1. Humanized extra gap (set after each post to enforce 5–15 min beyond minimum)
+    next_after = state.get("next_action_after", 0.0)
+    if now < next_after:
+        wait_m = (next_after - now) / 60
+        log.info(f"Governor: humanized gap – wait {wait_m:.1f}m more – skip")
+        return False
+
+    # 2. Hard minimum gap (10 min)
     if log_ts:
         gap = now - log_ts[-1]
         if gap < RATE_MIN_GAP:
             log.info(f"Governor: gap {gap:.0f}s < {RATE_MIN_GAP}s – skip")
             return False
 
-    # 2. Hourly cap
+    # 3. Burst guard (≤3 in any 30-minute window)
+    burst_count = sum(1 for t in log_ts if now - t < RATE_BURST_WIN)
+    if burst_count >= RATE_MAX_BURST:
+        log.info(f"Governor: burst cap {burst_count}/{RATE_MAX_BURST} in 30 min – skip")
+        return False
+
+    # 4. Hourly cap
     hour_count = sum(1 for t in log_ts if now - t < 3600)
     if hour_count >= RATE_MAX_HOUR:
         log.info(f"Governor: hourly cap {hour_count}/{RATE_MAX_HOUR} – skip")
         return False
 
-    # 3. Daily cap
+    # 5. Daily cap
     if len(log_ts) >= RATE_MAX_DAY:
         log.info(f"Governor: daily cap {len(log_ts)}/{RATE_MAX_DAY} – skip")
         return False
@@ -340,8 +366,17 @@ def can_act(state: dict) -> bool:
 
 
 def record_action(state: dict) -> None:
-    """Append current timestamp and immediately flush state to disk."""
-    state.setdefault("actions_log", []).append(time.time())
+    """Append current timestamp, set humanized next-action window, and flush to disk."""
+    now = time.time()
+    state.setdefault("actions_log", []).append(now)
+    # Humanized extra delay: 5–15 min on top of the hard 10-min gap
+    extra = random.randint(HUMANIZE_EXTRA_LOW, HUMANIZE_EXTRA_HIGH)
+    state["next_action_after"] = now + RATE_MIN_GAP + extra
+    log.info(
+        f"Governor: next action window opens in "
+        f"{(RATE_MIN_GAP + extra) / 60:.1f} min "
+        f"(10 min gap + {extra // 60} min humanized delay)"
+    )
     save_state(state)
 
 
@@ -703,6 +738,11 @@ def run_mentions_mode(
             log.info(f"Mention {tid}: already replied – skip")
             continue
 
+        # Humanization: intentionally skip ~40% of opportunities
+        if random.random() < HUMANIZE_SKIP_RATE:
+            log.info(f"Mention {tid}: humanized skip (40% chance) – will retry next cycle")
+            return False
+
         if not can_act(state):
             return False
 
@@ -777,6 +817,11 @@ def run_sniping_mode(
             eligible, reason = is_eligible_club_tweet(tweet)
             if not eligible:
                 log.info(f"Snipe @{username} {tid}: ineligible ({reason})")
+                continue
+
+            # Humanization: intentionally skip ~40% of opportunities
+            if random.random() < HUMANIZE_SKIP_RATE:
+                log.info(f"Snipe @{username} {tid}: humanized skip – will retry next cycle")
                 continue
 
             if not can_act(state):
@@ -892,6 +937,7 @@ def probe_data_dir() -> None:
             "actions_log":         [],
             "target_last_acted":   {},
             "recovery_tweets_log": [],
+            "next_action_after":   0.0,
         }
         STATE_FILE_PATH.write_text(
             json.dumps(default_state, ensure_ascii=False, indent=2),
@@ -920,7 +966,10 @@ def main() -> None:
     log.info(f"  OPENAI_MODEL  : {OPENAI_MODEL}")
     log.info(f"  STATE_FILE    : {STATE_FILE_PATH}")
     log.info(f"  PENDING_FILE  : {PENDING_FILE_PATH}  {'← drafts written here' if DRY_RUN else '← not used (DRY_RUN=false)'}")
-    log.info(f"  Rate limits   : gap≥{RATE_MIN_GAP}s | {RATE_MAX_HOUR}/hr | {RATE_MAX_DAY}/day")
+    log.info(
+        f"  Rate limits   : gap≥{RATE_MIN_GAP//60}min | burst≤{RATE_MAX_BURST}/30min | "
+        f"{RATE_MAX_HOUR}/hr | {RATE_MAX_DAY}/day | skip={int(HUMANIZE_SKIP_RATE*100)}%"
+    )
     log.info(f"  Recovery caps : {RECOVERY_MAX_DAY}/day | gap≥{RECOVERY_MIN_GAP//3600}h")
     log.info(f"  Targets       : {len(TARGET_USERNAMES)} club accounts (inactive in recovery mode)")
 
@@ -964,8 +1013,8 @@ def main() -> None:
 
         save_state(state)
 
-        sleep_s = random.randint(45, 90)  # 45–90 seconds per spec
-        log.info(f"Sleeping {sleep_s}s …")
+        sleep_s = random.randint(300, 600)  # 5–10 min poll cycle
+        log.info(f"Sleeping {sleep_s}s ({sleep_s // 60}m {sleep_s % 60}s) …")
         time.sleep(sleep_s)
 
 
