@@ -23,11 +23,12 @@ import urllib.request
 import urllib.error
 
 API_URL = "https://backboard.railway.app/graphql/v2"
-GITHUB_REPO = "mohammed8500/bugksa-bot"
-PROJECT_NAME = "bugksa-bot"
-SERVICE_NAME = "worker"
-VOLUME_NAME  = "bot_data"
-MOUNT_PATH   = "/app/data"
+GITHUB_REPO    = "mohammed8500/bugksa-bot"
+PROJECT_NAME   = "bugksa-bot"
+PROJECT_ID     = "97c65c33-2746-4be6-b541-2422dae46653"   # معرّف مشروع bugksa-bot
+SERVICE_NAME   = "worker"
+VOLUME_NAME    = "bot_data"
+MOUNT_PATH     = "/app/data"
 REQUIRED_VARS = [
     "OPENAI_API_KEY",
     "X_API_KEY",
@@ -215,9 +216,8 @@ def main():
 
     print(f"إجمالي المشاريع: {len(all_projects)}\n")
 
-    correct_project = None    # المشروع الصحيح bugksa-bot
+    correct_project = None    # المشروع الصحيح bugksa-bot (معرّفه: PROJECT_ID)
     to_delete = []            # المشاريع المراد حذفها
-    bugksa_candidates = []    # مشاريع مرتبطة بالـ repo
 
     for p in all_projects:
         services = [e["node"] for e in p["services"]["edges"]]
@@ -225,45 +225,32 @@ def main():
             (s.get("source") or {}).get("repo") == GITHUB_REPO
             for s in services
         )
-        is_named_correctly = p["name"].lower() == PROJECT_NAME.lower()
+        is_canonical = p["id"] == PROJECT_ID
 
         status = []
-        if is_named_correctly:
-            status.append("اسم صحيح")
-        if linked:
-            status.append(f"مرتبط بـ {GITHUB_REPO}")
+        if is_canonical:
+            status.append("✅ المشروع الأساسي")
+        elif p["name"].lower() == PROJECT_NAME.lower():
+            status.append("اسم مطابق (نسخة مكررة)")
+        elif linked:
+            status.append(f"مرتبط بـ {GITHUB_REPO} (نسخة مكررة)")
+        else:
+            status.append("عشوائي")
 
-        print(f"  [{p['id'][:8]}] {p['name']:35} | {', '.join(status) or 'عشوائي/غير معروف'}")
+        print(f"  [{p['id'][:8]}] {p['name']:35} | {', '.join(status)}")
 
-        if is_named_correctly or linked:
-            bugksa_candidates.append(p)
+        if is_canonical:
+            correct_project = p
         else:
             to_delete.append(p)
 
     # ── 3. Determine canonical project ────────────────────────────────────────
     separator("3. تحديد المشروع الأساسي")
 
-    if bugksa_candidates:
-        # نفضّل الذي اسمه صحيح ومرتبط، ثم الأحدث
-        def score(p):
-            services = [e["node"] for e in p["services"]["edges"]]
-            linked = any(
-                (s.get("source") or {}).get("repo") == GITHUB_REPO
-                for s in services
-            )
-            named = p["name"].lower() == PROJECT_NAME.lower()
-            return (named + linked, p["createdAt"])
-
-        bugksa_candidates.sort(key=score, reverse=True)
-        correct_project = bugksa_candidates[0]
-        duplicates = bugksa_candidates[1:]
-        to_delete.extend(duplicates)
-
-        print(f"✅ المشروع الأساسي: {correct_project['name']} [{correct_project['id'][:8]}]")
-        if duplicates:
-            print(f"⚠️  نسخ مكررة ستُحذف: {[p['name'] for p in duplicates]}")
+    if correct_project:
+        print(f"✅ المشروع الأساسي: {correct_project['name']} [{correct_project['id']}]")
     else:
-        print(f"⚠️  لا يوجد مشروع bugksa-bot — سيتم إنشاؤه")
+        print(f"⚠️  المشروع {PROJECT_ID} غير موجود في الحساب — سيتم إنشاؤه")
 
     # ── 4. Delete unwanted projects ────────────────────────────────────────────
     separator("4. حذف المشاريع غير الضرورية")
@@ -291,7 +278,7 @@ def main():
             print("(dry-run) سيتم إنشاء مشروع bugksa-bot")
             return  # can't continue without real project ID
 
-    project_id = correct_project["id"]
+    project_id = PROJECT_ID
 
     # Refresh project services after deletions
     fresh = gql(token, Q_PROJECTS)["projects"]["edges"]
