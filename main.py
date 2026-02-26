@@ -12,13 +12,16 @@ Required:
   X_ACCESS_SECRET   – Twitter/X access token secret
 
 Optional (defaults shown):
-  OPENAI_MODEL      – OpenAI model name          (default: gpt-5-mini)
-  STATE_FILE_PATH   – Path to JSON state file    (default: ./state.json)
-  DRY_RUN           – "true" → never post        (default: true)
-  RECOVERY_MODE     – "true" → only status tweets (default: true)
+  OPENAI_MODEL      – OpenAI model name            (default: gpt-5-mini)
+  STATE_FILE_PATH   – Path to JSON state file      (default: /app/data/state.json)
+  PENDING_FILE_PATH – Path to pending drafts file  (default: /app/data/pending.json)
+  DRY_RUN           – "true" → never post to X     (default: true)
+  RECOVERY_MODE     – "true" → only status tweets  (default: true)
 
-Recovery mode is the safe default for previously-flagged accounts.
-Set RECOVERY_MODE=false and DRY_RUN=false only when ready to go live.
+Safe defaults for a previously-flagged account:
+  RECOVERY_MODE=true  → replies and sniping disabled; only harmless status tweets
+  DRY_RUN=true        → nothing posted to X; generated drafts saved to PENDING_FILE_PATH
+Set both to "false" only when the account is cleared and ready to go live.
 """
 
 import json
@@ -62,10 +65,11 @@ X_API_SECRET    = _env("X_API_SECRET")
 X_ACCESS_TOKEN  = _env("X_ACCESS_TOKEN")
 X_ACCESS_SECRET = _env("X_ACCESS_SECRET")
 
-OPENAI_MODEL    = _env("OPENAI_MODEL", "gpt-5-mini")
-STATE_FILE_PATH = Path(_env("STATE_FILE_PATH", "./state.json"))
-DRY_RUN         = _flag("DRY_RUN",        default=True)
-RECOVERY_MODE   = _flag("RECOVERY_MODE",  default=True)
+OPENAI_MODEL      = _env("OPENAI_MODEL",      "gpt-5-mini")
+STATE_FILE_PATH   = Path(_env("STATE_FILE_PATH",   "/app/data/state.json"))
+PENDING_FILE_PATH = Path(_env("PENDING_FILE_PATH", "/app/data/pending.json"))
+DRY_RUN           = _flag("DRY_RUN",         default=True)
+RECOVERY_MODE     = _flag("RECOVERY_MODE",   default=True)
 
 # ── Rate-limit constants ──────────────────────────────────────────────────────
 RATE_MIN_GAP  = 600   # ≥10 minutes between any two actions
@@ -132,6 +136,43 @@ def save_state(state: dict) -> None:
     state["recovery_tweets_log"] = [t for t in state.get("recovery_tweets_log", []) if now - t < 86400]
     with open(STATE_FILE_PATH, "w", encoding="utf-8") as f:
         json.dump(state, f, ensure_ascii=False, indent=2)
+
+
+# ── Pending drafts (DRY_RUN output) ──────────────────────────────────────────
+
+def load_pending() -> list:
+    """Load existing pending drafts; return empty list if file absent/corrupt."""
+    try:
+        with open(PENDING_FILE_PATH, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return []
+
+
+def save_pending_draft(text: str, draft_type: str = "recovery") -> None:
+    """Append a generated draft to PENDING_FILE_PATH for human review.
+
+    Each entry records:
+      text         – the tweet that would have been posted
+      type         – draft category (always "recovery" in recovery mode)
+      generated_at – UTC ISO-8601 timestamp
+      status       – "pending" (unchanged until a human promotes/discards it)
+    """
+    PENDING_FILE_PATH.parent.mkdir(parents=True, exist_ok=True)
+    drafts = load_pending()
+    entry = {
+        "text":         text,
+        "type":         draft_type,
+        "generated_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "status":       "pending",
+    }
+    drafts.append(entry)
+    with open(PENDING_FILE_PATH, "w", encoding="utf-8") as f:
+        json.dump(drafts, f, ensure_ascii=False, indent=2)
+    log.info(
+        f"[DRAFT] Saved to {PENDING_FILE_PATH}  "
+        f"(total pending: {len(drafts)})"
+    )
 
 
 # ── Global Safety Governor ────────────────────────────────────────────────────
@@ -333,7 +374,7 @@ def post_reply(
 
 def post_tweet(client: tweepy.Client, text: str, state: dict) -> bool:
     if DRY_RUN:
-        log.info(f"[DRY_RUN] Would post: {text!r}")
+        log.info("[DRY_RUN] create_tweet SKIPPED (DRY_RUN=true) — draft already saved to pending.json")
         record_action(state)
         return True
     try:
@@ -521,7 +562,16 @@ def run_recovery_mode(client: tweepy.Client, ai: OpenAI, state: dict) -> bool:
         return False
 
     text = generate_recovery_tweet(ai)
-    log.info("Recovery: posting harmless status tweet")
+
+    # Always log the draft clearly so it is visible in Railway logs
+    log.info(f"[DRAFT] Recovery tweet generated ──────────────────────────")
+    log.info(f"[DRAFT] {text!r}")
+    log.info(f"[DRAFT] ────────────────────────────────────────────────────")
+
+    # In dry-run, save to pending.json for human review; never call create_tweet
+    if DRY_RUN:
+        save_pending_draft(text, draft_type="recovery")
+
     if post_tweet(client, text, state):
         state["recovery_tweets_log"].append(now)
         save_state(state)
@@ -539,12 +589,14 @@ def main() -> None:
 
     validate_env()
 
-    log.info(f"  DRY_RUN       : {DRY_RUN}")
-    log.info(f"  RECOVERY_MODE : {RECOVERY_MODE}")
+    log.info(f"  DRY_RUN       : {DRY_RUN}  {'← no posts will reach X' if DRY_RUN else '← LIVE posting enabled'}")
+    log.info(f"  RECOVERY_MODE : {RECOVERY_MODE}  {'← replies/sniping disabled' if RECOVERY_MODE else '← full mode'}")
     log.info(f"  OPENAI_MODEL  : {OPENAI_MODEL}")
     log.info(f"  STATE_FILE    : {STATE_FILE_PATH}")
+    log.info(f"  PENDING_FILE  : {PENDING_FILE_PATH}  {'← drafts written here' if DRY_RUN else '← not used (DRY_RUN=false)'}")
     log.info(f"  Rate limits   : gap≥{RATE_MIN_GAP}s | {RATE_MAX_HOUR}/hr | {RATE_MAX_DAY}/day")
-    log.info(f"  Targets       : {len(TARGET_USERNAMES)} club accounts")
+    log.info(f"  Recovery caps : {RECOVERY_MAX_DAY}/day | gap≥{RECOVERY_MIN_GAP//3600}h")
+    log.info(f"  Targets       : {len(TARGET_USERNAMES)} club accounts (inactive in recovery mode)")
 
     ai, client = build_clients()
     state = load_state()
