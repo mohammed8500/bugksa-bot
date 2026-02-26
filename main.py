@@ -58,7 +58,8 @@ MIN_GAP_SECONDS       = 600    # ≥10 min between any two actions
 MAX_PER_HOUR          = 6      # rolling 60-min cap
 MAX_PER_DAY           = 25     # rolling 24-hour cap
 DERBY_BURST_MAX_30MIN = 3      # max 3 actions in any 30-minute window
-HUMANIZE_SKIP_RATE    = 0.40   # intentionally skip 40 % of opportunities
+HUMANIZE_SKIP_RATE    = 0.40   # intentionally skip 40 % of opportunities (clubs)
+PERSONALITY_SKIP_RATE = 0.70   # skip 70 % for personal sports accounts (occasional replies)
 HUMANIZE_EXTRA_LOW    = 300    # +5 min after posting (humanized gap)
 HUMANIZE_EXTRA_HIGH   = 900    # +15 min after posting
 RECOVERY_SILENCE_H    = (2, 3) # 2-3 h silence window after a burst
@@ -95,7 +96,29 @@ GLOBAL_CLUBS: dict[str, dict] = {
     "Atleti":      {"origin": "global"},
 }
 
-TARGET_USERNAMES: dict[str, dict] = {**SAUDI_CLUBS, **GLOBAL_CLUBS}
+# ── Personal sports accounts (journalists / influencers / players) ─────────────
+# Replies are occasional (70 % skip) – see PERSONALITY_SKIP_RATE
+
+PERSONALITY_ACCOUNTS: dict[str, dict] = {
+    "FH_MHY":         {"origin": "personality"},   # فهد المحياوي
+    "Nssr__9":        {"origin": "personality"},   # أبو فيصل
+    "atc8877":        {"origin": "personality"},   # مشاري الشمري
+    "Nawaf_STATS":    {"origin": "personality"},   # نواف التميمي
+    "bt3":            {"origin": "personality"},   # عمرو
+    "OLYAN15K":       {"origin": "personality"},   # خالد العليان
+    "Cristiano":      {"origin": "personality"},   # Cristiano Ronaldo
+    "sevromweh":      {"origin": "personality"},   # سطام
+    "ahmadassiri1":   {"origin": "personality"},   # احمد عسيري
+    "Rabanalsafena":  {"origin": "personality"},   # وليد سعيد
+    "3zoozvic":       {"origin": "personality"},   # عزيز بن خالد
+    "alaa_saeed88":   {"origin": "personality"},   # علاء سعيد
+    "JstMsh":         {"origin": "personality"},   # Msh
+    "OfficialHSN":    {"origin": "personality"},   # حسن الحسناني
+    "Mti115":         {"origin": "personality"},   # ميماتي
+    "OffOMR":         {"origin": "personality"},   # ابو سعد
+}
+
+TARGET_USERNAMES: dict[str, dict] = {**SAUDI_CLUBS, **GLOBAL_CLUBS, **PERSONALITY_ACCOUNTS}
 
 RIVAL_PAIRS: list[tuple[str, str]] = [
     ("Alhilal_FC",  "AlNassrFC"),
@@ -763,8 +786,9 @@ def monitor_mentions_and_snipes() -> None:
                         save_state(state)
                         continue
 
-                    # Humanize: intentionally skip 40 % of opportunities
-                    if random.random() < HUMANIZE_SKIP_RATE:
+                    # Humanize: clubs skip 40 %, personality accounts skip 70 %
+                    skip_rate = PERSONALITY_SKIP_RATE if meta.get("origin") == "personality" else HUMANIZE_SKIP_RATE
+                    if random.random() < skip_rate:
                         log.info(f"Snipe @{uname} {tid}: humanized skip")
                         continue
 
