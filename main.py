@@ -126,7 +126,10 @@ _TECH_WORDS: set[str] = {
     "lag", "timeout", "bug", "404", "patch", "server", "crash", "firewall",
     "cache", "deployment", "memory", "leak", "loop", "null", "error", "stack",
     "overflow", "hotfix", "debug", "kernel", "panic", "cpu", "buffer", "ping",
-    "rollback", "deploy", "سيرفر", "لاق", "باق", "تايم أوت",
+    "rollback", "deploy",
+    # Extended – covers banter-token tech vocabulary
+    "beta", "plugin", "script", "exe", "edition", "build", "reboot", "mode",
+    "سيرفر", "لاق", "باق", "تايم أوت",
 }
 
 # Banter / sarcasm energy signals – at least one must appear (PART 3 tone)
@@ -134,6 +137,65 @@ _SARCASM_SIGNALS: set[str] = {
     "?", "!", "💀", "😂", "🤣", "🤦", "😭", "🤡", "💔", "🔥",
     "bro", "lol", "smh", "wtf",
     "يا ", "خلاص", "ما ", "والله",
+}
+
+# Per-club English banter tokens  (≥1 required in any English reply)
+# Each value is the canonical Twitter handle mapped to its mock lexicon.
+_EN_BANTER_TOKENS: dict[str, list[str]] = {
+    "ManUtd":        ["museum fc", "404 trophies", "nostalgia build", "glory days patch",
+                      "old trafford.exe"],
+    "ChelseaFC":     ["billion-dollar beta", "chaos patch", "no stable release",
+                      "owner swap edition", "chelseafc reboot"],
+    "Arsenal":       ["almost fc", "beta champions", "april crash", "always next year.exe",
+                      "bottle mode"],
+    "SpursOfficial": ["no-trophy mode", "empty cabinet.exe", "bottle.exe",
+                      "final-stage crash", "lilywhite timeout"],
+    "LFC":           ["pressing.exe stuck", "var dependency", "legacy cache",
+                      "klopp.exe exited", "anfield nostalgia build"],
+    "ManCity":       ["financial plugin", "115 charges edition", "fpl owner mode",
+                      "fair play firewall", "city bot"],
+    "FCBarcelona":   ["economic levers", "debt mode", "ghost payroll",
+                      "barca token", "laporta.dll"],
+    "realmadrid":    ["ucl script", "plot armor", "final boss mode",
+                      "referee.dll", "bernabeu cheat code"],
+    "juventusfc":    ["calciopoli cache", "old lady patch", "scudetto rollback",
+                      "juventus bios"],
+    "PSG_inside":    ["qsi.exe", "galactico overflow", "trophies not found in europe",
+                      "psg kernel"],
+    "FCBayern":      ["bundesliga autopilot", "german efficiency build",
+                      "rekordmeister loop", "bundesliga.exe"],
+    "BVB":           ["sell-first protocol", "almost champions.exe",
+                      "dortmund 404", "silverware not found"],
+    "Atleti":        ["grind mode fc", "defensive kernel", "simeone.exe",
+                      "0-0 build"],
+    "LCFC":          ["miracle patch", "2016 legacy build", "foxes memory leak",
+                      "vardy.dll"],
+}
+
+# Flat set of all tokens for O(1) lookup
+_EN_BANTER_TOKENS_FLAT: set[str] = {
+    token
+    for tokens in _EN_BANTER_TOKENS.values()
+    for token in tokens
+}
+
+# Club-recognition aliases – if none match, the English banter check passes through
+# (handles Saudi clubs or unrecognised clubs tweeting in English)
+_EN_CLUB_ALIASES: set[str] = {
+    "manchester united", "man utd", "man united",
+    "chelsea",
+    "arsenal", "gunners",
+    "tottenham", "spurs",
+    "liverpool",
+    "manchester city", "man city",
+    "barcelona", "barca",
+    "real madrid", "madrid",
+    "juventus", "juve",
+    "psg", "paris saint-germain",
+    "bayern", "fc bayern",
+    "dortmund", "bvb",
+    "atletico",
+    "leicester",
 }
 
 
@@ -154,12 +216,38 @@ def has_banter_energy(text: str) -> bool:
     return any(s in text for s in _SARCASM_SIGNALS)
 
 
-def quality_ok(text: str) -> bool:
-    """Identity gate – all three checks must pass, otherwise the reply is rejected.
+def has_english_banter_token(text: str) -> bool:
+    """English-specific check: reply must contain ≥1 club mock token.
+
+    Normalisation: underscores and .exe suffixes are collapsed to spaces
+    before matching so tokens like "april crash" match "April_crash.exe".
+
+    Pass-through rule: if no recognised club alias appears in the text
+    (e.g. the tweet is about a Saudi club) the check is waived – the
+    existing tech + banter energy gates are sufficient in that case.
+    """
+    raw = text.lower()
+    # Normalise: underscore → space, strip common file-extension noise
+    normalised = raw.replace("_", " ").replace(".exe", "").replace(".dll", "")
+    # Token matched (raw or normalised) → pass
+    if any(token in raw for token in _EN_BANTER_TOKENS_FLAT):
+        return True
+    if any(token in normalised for token in _EN_BANTER_TOKENS_FLAT):
+        return True
+    # No recognised target club alias in text → waive the token requirement
+    if not any(alias in raw for alias in _EN_CLUB_ALIASES):
+        return True
+    # Known club present but no banter token → reject
+    return False
+
+
+def quality_ok(text: str, lang_hint: str = "en") -> bool:
+    """Identity gate – all checks must pass, otherwise the reply is rejected.
 
     Check 1: no generic/journalist phrasing
     Check 2: contains a tech metaphor  (PART 2 of the 3-part structure)
     Check 3: contains banter/sarcasm energy  (PART 3 tone)
+    Check 4: (English only) ≥1 club mock / banter token
     """
     if not text or len(text.strip()) < 8:
         return False
@@ -168,6 +256,8 @@ def quality_ok(text: str) -> bool:
     if not has_tech_metaphor(text):
         return False
     if not has_banter_energy(text):
+        return False
+    if lang_hint == "en" and not has_english_banter_token(text):
         return False
     return True
 
@@ -296,7 +386,23 @@ You are @BugKSA – a Saudi football banter account. NOT a sports journalist. NO
   Example (Arabic):  "الدفاع crash كامل، والـ VAR بعد شايل null pointer 🤦‍♂️"
   Example (English): "That defending just triggered a full server meltdown – 404 tactics not found 💀"
 
+═══ ENGLISH BANTER TOKENS – use ≥1 per English reply ═══
+  Man Utd     → "museum FC"  · "404 trophies"  · "nostalgia build"
+  Chelsea     → "billion-dollar beta"  · "chaos patch"  · "no stable release"
+  Arsenal     → "almost FC"  · "beta champions"  · "April crash"
+  Tottenham   → "no-trophy mode"  · "empty cabinet.exe"  · "bottle.exe"
+  Liverpool   → "pressing.exe stuck"  · "VAR dependency"  · "legacy cache"
+  Man City    → "financial plugin"  · "115 charges edition"
+  Barcelona   → "economic levers"  · "debt mode"  · "ghost payroll"
+  Real Madrid → "UCL script"  · "plot armor"  · "final boss mode"
+
+  Accept examples:
+    "Arsenal running April_crash.exe again 💀"
+    "Chelsea still in billion-dollar beta – no stable release detected 😂"
+    "United nostalgia build loading… 404 trophies not found 🤦"
+
 ═══ BANNED OUTPUT – regenerate immediately if any of these appear ═══
+  ✗ "great performance tonight"  ·  "stats are impressive"  ·  "team is dominating"
   ✗ "Stats are crazy this season" or any neutral stats observation
   ✗ "Impressive performance tonight" or any generic praise
   ✗ "Both teams played well" – neutral = auto-rejected
@@ -315,9 +421,10 @@ You are @BugKSA – a Saudi football banter account. NOT a sports journalist. NO
   2. PART 1 (target/jab) is present
   3. PART 2 (tech metaphor keyword) is present
   4. PART 3 (punchline/meme ending) lands the joke
-  5. ZERO journalist phrasing or neutral analysis
-  6. Content is safe and clean
-  7. Single punchy line ≤240 characters
+  5. For English replies: ≥1 club banter token is present (see ENGLISH BANTER TOKENS above)
+  6. ZERO journalist phrasing or neutral analysis
+  7. Content is safe and clean
+  8. Single punchy line ≤240 characters
 """
 
 # Style seeds drive creative variety
@@ -340,12 +447,26 @@ _STYLE_SEEDS_EN: list[str] = [
 def generate_reply(tweet_text: str, lang_hint: str = "en") -> str:
     """Generate a banter reply, retrying up to 3 times until quality_ok() passes."""
     seed = random.choice(_STYLE_SEEDS_AR if lang_hint == "ar" else _STYLE_SEEDS_EN)
+
+    # English user prompt includes explicit banter-token reminder
+    if lang_hint == "en":
+        structure_line = (
+            "Must follow the 3-part structure: "
+            "(1) jab at the club/situation  (2) tech metaphor  (3) sharp meme-like punchline. "
+            "For English: embed ≥1 club banter token "
+            "(e.g. '404 trophies', 'nostalgia build', 'beta champions', 'chaos patch', "
+            "'plot armor', 'financial plugin', 'debt mode', 'no-trophy mode')."
+        )
+    else:
+        structure_line = (
+            "Must follow the 3-part structure: "
+            "(1) jab at the club/situation  (2) tech metaphor  (3) sharp meme-like punchline."
+        )
+
     user_prompt = (
         f"Style seed: {seed}\n\n"
         f"Target tweet:\n{tweet_text}\n\n"
-        "Write ONE reply tweet now. "
-        "Must follow the 3-part structure: "
-        "(1) jab at the club/situation  (2) tech metaphor  (3) sharp meme-like punchline."
+        f"Write ONE reply tweet now. {structure_line}"
     )
     for attempt in range(3):
         try:
@@ -361,7 +482,7 @@ def generate_reply(tweet_text: str, lang_hint: str = "en") -> str:
             text  = (resp.choices[0].message.content or "").strip()
             reply = " ".join(text.splitlines()).strip()[:240]
 
-            if quality_ok(reply):
+            if quality_ok(reply, lang_hint):
                 if attempt > 0:
                     log.info(f"Identity gate: passed on attempt {attempt + 1}")
                 return reply
@@ -445,7 +566,7 @@ def run_recovery_mode(state: dict) -> None:
     reply = ""
     for attempt in range(3):
         cand = generate_reply(base, lang_hint="ar")
-        if quality_ok(cand):
+        if quality_ok(cand, "ar"):
             reply = cand
             break
         log.info(f"Recovery: quality_ok fail attempt {attempt + 1} → retrying")
@@ -528,7 +649,7 @@ def monitor_mentions_and_snipes() -> None:
                     reply = ""
                     for attempt in range(3):
                         cand = generate_reply(tw.text, lang_hint=lang_hint)
-                        if quality_ok(cand):
+                        if quality_ok(cand, lang_hint):
                             reply = cand
                             break
                         log.info(f"Mention {tid} quality_ok fail attempt {attempt + 1} → retrying")
@@ -595,7 +716,7 @@ def monitor_mentions_and_snipes() -> None:
                     reply = ""
                     for attempt in range(3):
                         cand = generate_reply(tw.text, lang_hint=lang_hint)
-                        if quality_ok(cand):
+                        if quality_ok(cand, lang_hint):
                             reply = cand
                             break
                         log.info(f"Snipe @{uname} quality_ok fail attempt {attempt + 1} → retrying")
