@@ -1,1022 +1,634 @@
 """
-BugKSA – Saudi Football Sarcasm Bot
+BugKSA – Saudi Football Banter Bot
 ====================================
+Replies to club accounts and mentions with short, punchy, tech-flavoured
+Saudi football banter.  Every post goes through a 3-layer safety stack:
 
-Railway Variables to set
-─────────────────────────
-Required:
-  OPENAI_API_KEY    – OpenAI secret key
-  X_API_KEY         – Twitter/X consumer key
-  X_API_SECRET      – Twitter/X consumer secret
-  X_ACCESS_TOKEN    – Twitter/X access token
-  X_ACCESS_SECRET   – Twitter/X access token secret
-
-Optional (defaults shown):
-  OPENAI_MODEL      – OpenAI model name            (default: gpt-4o-mini)
-  STATE_FILE_PATH   – Path to JSON state file      (default: /app/data/state.json)
-  PENDING_FILE_PATH – Path to pending drafts file  (default: /app/data/pending.json)
-  DRY_RUN           – "true" → never post to X     (default: false)
-  RECOVERY_MODE     – "true" → only status tweets  (default: true)
-
-Safe defaults for a previously-flagged account:
-  RECOVERY_MODE=true  → replies and sniping disabled; only harmless status tweets
-  DRY_RUN=true        → nothing posted to X; generated drafts saved to PENDING_FILE_PATH
-Set both to "false" only when the account is cleared and ready to go live.
+  Layer 1 – Anti-spam governor  (HARD limits, never overridden)
+  Layer 2 – Identity gate        (quality_ok() blocks generic/journalist output)
+  Layer 3 – OpenAI constitution  (SYSTEM_CONSTITUTION enforces 3-part structure)
 """
 
-import json
-import logging
 import os
-import random
 import re
-import sys
+import json
 import time
+import random
+import logging
 from pathlib import Path
 
 import tweepy
 from openai import OpenAI
 
 # ── Logging ───────────────────────────────────────────────────────────────────
+
 logging.basicConfig(
     level=logging.INFO,
-    format="%(asctime)s  %(levelname)-7s  %(message)s",
+    format="%(asctime)s  %(levelname)-8s %(message)s",
     datefmt="%Y-%m-%d %H:%M:%S",
 )
 log = logging.getLogger("bugksa")
 
-# ── Env helpers ───────────────────────────────────────────────────────────────
-
-def _env(key: str, default: str = "") -> str:
-    return os.environ.get(key, default).strip()
+# ── Config (ENV) ──────────────────────────────────────────────────────────────
 
 
-def _flag(key: str, default: bool = True) -> bool:
-    """Read a boolean env var. Absent → default."""
-    raw = os.environ.get(key)
-    if raw is None:
-        return default
-    return raw.strip().lower() not in ("0", "false", "no", "off")
+def env(name: str, required: bool = True) -> str:
+    v = (os.getenv(name) or "").strip()
+    if required and not v:
+        raise RuntimeError(f"Missing required env var: {name}")
+    return v
 
 
-# ── Config ────────────────────────────────────────────────────────────────────
-OPENAI_API_KEY  = _env("OPENAI_API_KEY")
-X_API_KEY       = _env("X_API_KEY")
-X_API_SECRET    = _env("X_API_SECRET")
-X_ACCESS_TOKEN  = _env("X_ACCESS_TOKEN")
-X_ACCESS_SECRET = _env("X_ACCESS_SECRET")
+OPENAI_API_KEY  = env("OPENAI_API_KEY")
+OPENAI_MODEL    = (os.getenv("OPENAI_MODEL") or "gpt-4o-mini").strip()
+X_API_KEY       = env("X_API_KEY")
+X_API_SECRET    = env("X_API_SECRET")
+X_ACCESS_TOKEN  = env("X_ACCESS_TOKEN")
+X_ACCESS_SECRET = env("X_ACCESS_SECRET")
 
-OPENAI_MODEL      = _env("OPENAI_MODEL",      "gpt-4o-mini")
-STATE_FILE_PATH   = Path(_env("STATE_FILE_PATH",   "/app/data/state.json"))
-PENDING_FILE_PATH = Path(_env("PENDING_FILE_PATH", "/app/data/pending.json"))
-DRY_RUN           = _flag("DRY_RUN",         default=False)
-RECOVERY_MODE     = _flag("RECOVERY_MODE",   default=True)
+DRY_RUN       = (os.getenv("DRY_RUN")       or "false").strip().lower() in ("1", "true", "yes")
+RECOVERY_MODE = (os.getenv("RECOVERY_MODE") or "false").strip().lower() in ("1", "true", "yes")
 
-# ── Rate-limit constants (CRITICAL ANTI-SPAM GOVERNOR – never override) ───────
-RATE_MIN_GAP     = 600   # ≥10 min between any two actions
-RATE_MAX_HOUR    = 6     # rolling 60-min cap
-RATE_MAX_DAY     = 25    # rolling 24-hour cap
+STATE_FILE = Path((os.getenv("STATE_FILE_PATH") or "/app/data/state.json").strip())
+STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
 
-# Burst guard: no more than 3 posts in any 30-minute window
-RATE_MAX_BURST   = 3
-RATE_BURST_WIN   = 1800  # 30 minutes
+# ── CRITICAL ANTI-SPAM GOVERNOR (HARD LIMITS – never override) ────────────────
 
-# Humanization: skip ~40 % of opportunities and add 5–15 min extra gap
-HUMANIZE_SKIP_RATE  = 0.40
-HUMANIZE_EXTRA_LOW  = 300   # 5 min
-HUMANIZE_EXTRA_HIGH = 900   # 15 min
+MIN_GAP_SECONDS       = 600    # ≥10 min between any two actions
+MAX_PER_HOUR          = 6      # rolling 60-min cap
+MAX_PER_DAY           = 25     # rolling 24-hour cap
+DERBY_BURST_MAX_30MIN = 3      # max 3 actions in any 30-minute window
+HUMANIZE_SKIP_RATE    = 0.40   # intentionally skip 40 % of opportunities
+HUMANIZE_EXTRA_LOW    = 300    # +5 min after posting (humanized gap)
+HUMANIZE_EXTRA_HIGH   = 900    # +15 min after posting
+RECOVERY_SILENCE_H    = (2, 3) # 2-3 h silence window after a burst
 
-# Recovery-mode constants (posted-flagged-account rehabilitation)
-RECOVERY_MAX_DAY = 3     # original status tweets per day
-RECOVERY_MIN_GAP = 7200  # ≥2 hours between recovery tweets
+# ── Club targets ──────────────────────────────────────────────────────────────
 
-# ── Target club accounts ──────────────────────────────────────────────────────
-TARGET_USERNAMES: list[str] = [
-    # Saudi Pro League
-    "Alhilal_FC", "AlNassrFC", "ittihad", "ALAHLI_FC",
-    "AlQadsiah", "AlShabab_FC", "AlFaisaly_FC", "AlTaawon_FC",
-    "AlFatehFC", "AlRaedFC",
-    # Saudi sports media / figures
-    "Hadaf_SA", "kooora",
-    # English Premier League
-    "ManUtd", "Arsenal", "ChelseaFC", "SpursOfficial",
-    "LCFC", "Everton", "WestHam", "Wolves",
-    # Champions League heavy-weights
-    "realmadrid", "FCBarcelona", "ManCity", "LFC",
-    "juventusfc", "PSG_inside", "FCBayern", "BVB",
-    "Atleti",
-]
-
-# ── Club personality profiles ─────────────────────────────────────────────────
-# lang: "ar-sa" → Saudi Arabic reply  |  "en" → English reply
-CLUB_PROFILES: dict[str, dict] = {
-    # Saudi Pro League ─────────────────────────────────────────────────────────
-    "Alhilal_FC":    {"name": "الهلال",         "lang": "ar-sa",
-                      "personality": "يتحدث من مركز التفوق المطلق كأنه يملك الدوري بالوراثة"},
-    "AlNassrFC":     {"name": "النصر",           "lang": "ar-sa",
-                      "personality": "مبني على الضجة والاحتفال المسبق، يعيش على المبالغة"},
-    "ittihad":       {"name": "الاتحاد",         "lang": "ar-sa",
-                      "personality": "فوضى منظمة، ديناميكية عاطفية، مسرح درامي من الدرجة الأولى"},
-    "ALAHLI_FC":     {"name": "الأهلي",          "lang": "ar-sa",
-                      "personality": "يختفي ثم يعود بقوة، بطل الكوميباك الأبدي"},
-    "AlQadsiah":     {"name": "القادسية",        "lang": "ar-sa",
-                      "personality": "مفاجأة الدوري، يظهر فجأة في القمة ثم يختفي كـ cache مؤقت"},
-    "AlShabab_FC":   {"name": "الشباب",          "lang": "ar-sa",
-                      "personality": "الفريق الذي يُعطي وعوداً أكثر من مسؤول تقني"},
-    "AlFaisaly_FC":  {"name": "الفيصلي",        "lang": "ar-sa",
-                      "personality": "تراث عريق لكن حظه يُشبه سيرفراً قديماً"},
-    "AlTaawon_FC":   {"name": "التعاون",         "lang": "ar-sa",
-                      "personality": "دائماً في المنتصف، لا صعود ولا هبوط، safe mode دائم"},
-    "AlFatehFC":     {"name": "الفتح",           "lang": "ar-sa",
-                      "personality": "ينام في الدوري ويصحى فجأة على الكأس"},
-    "AlRaedFC":      {"name": "الرائد",          "lang": "ar-sa",
-                      "personality": "يكافح البقاء كل موسم كأنه loop لا ينتهي"},
-    # Saudi sports media
-    "Hadaf_SA":      {"name": "هدف",             "lang": "ar-sa",
-                      "personality": "يتابع الأخبار قبل حدوثها، سيرفر الأخبار الكروية"},
-    "kooora":        {"name": "كووورة",           "lang": "ar-sa",
-                      "personality": "الحكم الأول والأخير في الإنترنت الكروي العربي"},
-    # English Premier League ───────────────────────────────────────────────────
-    "ManUtd":        {"name": "Man United",       "lang": "en",
-                      "personality": "living off Sir Alex's legacy like deprecated code nobody dares delete"},
-    "Arsenal":       {"name": "Arsenal",          "lang": "en",
-                      "personality": "always close to the title, always buffer overflow at the end"},
-    "ChelseaFC":     {"name": "Chelsea",          "lang": "en",
-                      "personality": "fires managers faster than an auto-deployment pipeline"},
-    "SpursOfficial": {"name": "Spurs",            "lang": "en",
-                      "personality": "brilliant in the first leg, crashes in the second like a beta server"},
-    "LCFC":          {"name": "Leicester",        "lang": "en",
-                      "personality": "one legendary patch release and then legacy mode forever"},
-    "Everton":       {"name": "Everton",          "lang": "en",
-                      "personality": "fighting relegation bravely every season, eternal survival mode"},
-    "WestHam":       {"name": "West Ham",         "lang": "en",
-                      "personality": "a whole city runs on football dreams and late goals"},
-    "Wolves":        {"name": "Wolves",           "lang": "en",
-                      "personality": "surprise compiler that never fully commits"},
-    # European heavy-weights ───────────────────────────────────────────────────
-    "realmadrid":    {"name": "Real Madrid",      "lang": "en",
-                      "personality": "scripted destiny – the universe is literally running their matchday cron job"},
-    "FCBarcelona":   {"name": "Barcelona",        "lang": "en",
-                      "personality": "obsessed with tiki-taka like a dev who caches everything and scores nothing"},
-    "ManCity":       {"name": "Man City",         "lang": "en",
-                      "personality": "petrodollar-powered machine: technically perfect, emotionally zero"},
-    "LFC":           {"name": "Liverpool",        "lang": "en",
-                      "personality": "lifts a trophy then emotionally collapses for two seasons straight"},
-    "juventusfc":    {"name": "Juventus",         "lang": "en",
-                      "personality": "Serie A's grandfather – still runs on Windows XP"},
-    "PSG_inside":    {"name": "PSG",              "lang": "en",
-                      "personality": "buys every star but can't find a working team.exe"},
-    "FCBayern":      {"name": "Bayern",           "lang": "en",
-                      "personality": "crushes the Bundesliga then gets a 500 Internal Error in Europe"},
-    "BVB":           {"name": "Dortmund",         "lang": "en",
-                      "personality": "terrifies you in the first leg then throws a NullPointerException in the second"},
-    "Atleti":        {"name": "Atlético",         "lang": "en",
-                      "personality": "parks the bus so hard even the VAR system can't find the attack folder"},
+SAUDI_CLUBS: dict[str, dict] = {
+    "Alhilal_FC": {"origin": "saudi"},
+    "AlNassrFC":  {"origin": "saudi"},
+    "ittihad":    {"origin": "saudi"},
+    "ALAHLI_FC":  {"origin": "saudi"},
+    "AlQadsiah":  {"origin": "saudi"},
+    "AlShabab_FC":{"origin": "saudi"},
+    "AlFaisaly_FC":{"origin":"saudi"},
+    "AlTaawon_FC":{"origin": "saudi"},
+    "AlFatehFC":  {"origin": "saudi"},
+    "AlRaedFC":   {"origin": "saudi"},
 }
 
-# ── Rivalry pairs (derby detection) ──────────────────────────────────────────
-RIVALRY_PAIRS: list[tuple[str, str]] = [
-    ("Alhilal_FC", "AlNassrFC"),    # الكلاسيكو السعودي
-    ("ittihad",    "ALAHLI_FC"),    # ديربي جدة
-    ("LFC",        "ManCity"),      # Liverpool–City
-    ("realmadrid", "FCBarcelona"),  # El Clásico
-    ("ManUtd",     "Arsenal"),      # historic PL rivalry
-    ("ManUtd",     "LFC"),          # North-West derby
-    ("realmadrid", "Atleti"),       # Madrid derby
-    ("juventusfc", "FCBarcelona"),  # Juve–Barca
-    ("FCBayern",   "BVB"),          # Der Klassiker
+GLOBAL_CLUBS: dict[str, dict] = {
+    "realmadrid":  {"origin": "global"},
+    "FCBarcelona": {"origin": "global"},
+    "ManUtd":      {"origin": "english"},
+    "Arsenal":     {"origin": "english"},
+    "ChelseaFC":   {"origin": "english"},
+    "SpursOfficial":{"origin":"english"},
+    "LCFC":        {"origin": "english"},
+    "LFC":         {"origin": "english"},
+    "ManCity":     {"origin": "english"},
+    "juventusfc":  {"origin": "global"},
+    "PSG_inside":  {"origin": "global"},
+    "FCBayern":    {"origin": "global"},
+    "BVB":         {"origin": "global"},
+    "Atleti":      {"origin": "global"},
+}
+
+TARGET_USERNAMES: dict[str, dict] = {**SAUDI_CLUBS, **GLOBAL_CLUBS}
+
+RIVAL_PAIRS: list[tuple[str, str]] = [
+    ("Alhilal_FC",  "AlNassrFC"),
+    ("ittihad",     "ALAHLI_FC"),
+    ("LFC",         "ManCity"),
+    ("realmadrid",  "FCBarcelona"),
+    ("ManUtd",      "Arsenal"),
 ]
 
-# ── Event detection engine ────────────────────────────────────────────────────
-# Order matters: trophy > goal > loss > conceded > win > generic
-# NOTE: \b word boundaries don't work with Arabic script; Arabic patterns use plain search.
-_EVENT_PATTERNS: dict[str, list[str]] = {
-    "trophy":   [r"\bchampion(s)?\b", r"\btitle\b", r"\btrophy\b", r"\bcup\b", r"🏆",
-                 "بطل", "لقب", "بطولة", "كأس"],
-    "goal":     [r"\bgoal\b", r"\bscores?\b", r"\bGOAL\b", r"\bgolazo\b", r"⚽",
-                 "يسجل", "هدف", "أهداف"],
-    "loss":     [r"\blos(e|t|ing)\b", r"\bdefeat(ed)?\b",
-                 "يخسر", "خسارة", "هزيمة", "انهيار"],
-    "conceded": [r"\bconcede(d|s)?\b", r"\bgave away\b",
-                 "يستقبل", "يتلقى"],
-    "win":      [r"\bwin(s|ning)?\b", r"\bwon\b", r"\bvictory\b", r"\b3 points\b",
-                 "يفوز", "فوز", "انتصار"],
+# ── Identity gate: quality filters ───────────────────────────────────────────
+
+# Generic / journalist phrases → auto-reject
+_GENERIC_PHRASES: list[str] = [
+    # English
+    "stats are crazy", "this season", "great match", "good result",
+    "well played", "played well", "impressive performance", "both teams",
+    "exciting game", "strong performance", "tough match", "quality football",
+    "incredible match", "wow what a", "what a game", "great game",
+    "dominated the", "very competitive", "amazing display",
+    # Arabic
+    "إحصائيات رائعة", "أداء رائع", "كلا الفريقين", "مباراة ممتازة",
+    "نتيجة جيدة", "أداء قوي", "لعبوا جيدًا", "لعبوا بشكل",
+    "مباراة مثيرة", "مباراة رائعة",
+]
+
+# Tech keywords – at least one must appear (PART 2 of the 3-part structure)
+_TECH_WORDS: set[str] = {
+    "lag", "timeout", "bug", "404", "patch", "server", "crash", "firewall",
+    "cache", "deployment", "memory", "leak", "loop", "null", "error", "stack",
+    "overflow", "hotfix", "debug", "kernel", "panic", "cpu", "buffer", "ping",
+    "rollback", "deploy", "سيرفر", "لاق", "باق", "تايم أوت",
+}
+
+# Banter / sarcasm energy signals – at least one must appear (PART 3 tone)
+_SARCASM_SIGNALS: set[str] = {
+    "?", "!", "💀", "😂", "🤣", "🤦", "😭", "🤡", "💔", "🔥",
+    "bro", "lol", "smh", "wtf",
+    "يا ", "خلاص", "ما ", "والله",
 }
 
 
-def detect_event(text: str) -> str:
-    """Return the dominant football event in tweet text, or 'generic'."""
-    for event, patterns in _EVENT_PATTERNS.items():
-        for pat in patterns:
-            if re.search(pat, text, re.IGNORECASE):
-                return event
-    return "generic"
-
-
-def detect_derby(username: str, tweet_text: str) -> bool:
-    """Return True when the tweet references a known rival of `username`."""
-    for pair in RIVALRY_PAIRS:
-        if username in pair:
-            rival = pair[1] if pair[0] == username else pair[0]
-            rival_profile = CLUB_PROFILES.get(rival, {})
-            rival_name    = rival_profile.get("name", rival)
-            if rival.lower() in tweet_text.lower() or rival_name.lower() in tweet_text.lower():
-                return True
+def looks_generic(text: str) -> bool:
+    t = text.lower()
+    if any(p in t for p in _GENERIC_PHRASES):
+        return True
+    if len(t.split()) > 25 and not any(w in t for w in _TECH_WORDS):
+        return True
     return False
 
 
-# ── Env validation ────────────────────────────────────────────────────────────
-
-def validate_env() -> None:
-    required = {
-        "OPENAI_API_KEY":  OPENAI_API_KEY,
-        "X_API_KEY":       X_API_KEY,
-        "X_API_SECRET":    X_API_SECRET,
-        "X_ACCESS_TOKEN":  X_ACCESS_TOKEN,
-        "X_ACCESS_SECRET": X_ACCESS_SECRET,
-    }
-    log.info("Checking env vars …")
-    for key, val in required.items():
-        if val:
-            masked = ("*" * max(0, len(val) - 4)) + val[-4:]
-        else:
-            masked = "(MISSING)"
-        log.info(f"  {key}: {masked}")
-
-    missing = [k for k, v in required.items() if not v]
-    if missing:
-        log.error(f"Missing required env vars: {', '.join(missing)}")
-        sys.exit(1)
+def has_tech_metaphor(text: str) -> bool:
+    return any(w in text.lower() for w in _TECH_WORDS)
 
 
-# ── Persistent state ──────────────────────────────────────────────────────────
+def has_banter_energy(text: str) -> bool:
+    return any(s in text for s in _SARCASM_SIGNALS)
+
+
+def quality_ok(text: str) -> bool:
+    """Identity gate – all three checks must pass, otherwise the reply is rejected.
+
+    Check 1: no generic/journalist phrasing
+    Check 2: contains a tech metaphor  (PART 2 of the 3-part structure)
+    Check 3: contains banter/sarcasm energy  (PART 3 tone)
+    """
+    if not text or len(text.strip()) < 8:
+        return False
+    if looks_generic(text):
+        return False
+    if not has_tech_metaphor(text):
+        return False
+    if not has_banter_energy(text):
+        return False
+    return True
+
+
+# ── State ─────────────────────────────────────────────────────────────────────
+
+
+def now_ts() -> int:
+    return int(time.time())
+
 
 def load_state() -> dict:
-    try:
-        with open(STATE_FILE_PATH, "r", encoding="utf-8") as f:
-            s = json.load(f)
-    except Exception:
+    if STATE_FILE.exists():
+        try:
+            with STATE_FILE.open("r", encoding="utf-8") as f:
+                s = json.load(f)
+        except Exception:
+            s = {}
+    else:
         s = {}
-    # Backwards-compatible defaults
-    s.setdefault("last_mention_id",     None)
-    s.setdefault("last_seen_by_target", {})   # {username: last_tweet_id}
-    s.setdefault("replied_tweet_ids",   [])   # dedupe set, trimmed to 500
-    s.setdefault("actions_log",         [])   # Unix timestamps of all actions
-    s.setdefault("target_last_acted",   {})   # {username: Unix timestamp}
-    s.setdefault("recovery_tweets_log", [])   # timestamps for recovery tweets
-    s.setdefault("next_action_after",   0.0)  # humanized gate: earliest next post
+    s.setdefault("last_mention_id",   None)
+    s.setdefault("replied_tweet_ids", [])
+    s.setdefault("actions_log",       [])   # Unix timestamps of all actions (last 24 h)
+    s.setdefault("last_seen_by_user", {})   # user_id → last processed tweet id
+    s.setdefault("last_action_ts",    0)
+    s.setdefault("derby_burst_log",   [])   # timestamps in last 30 min
+    s.setdefault("next_action_after", 0.0)  # humanized gate: earliest allowed next post
     return s
 
 
 def save_state(state: dict) -> None:
-    STATE_FILE_PATH.parent.mkdir(parents=True, exist_ok=True)
-    now = time.time()
-    state["replied_tweet_ids"]   = state.get("replied_tweet_ids",   [])[-500:]
-    state["actions_log"]         = [t for t in state.get("actions_log",         []) if now - t < 86400]
-    state["recovery_tweets_log"] = [t for t in state.get("recovery_tweets_log", []) if now - t < 86400]
-    with open(STATE_FILE_PATH, "w", encoding="utf-8") as f:
+    state["replied_tweet_ids"] = state.get("replied_tweet_ids", [])[-500:]
+    cutoff_24h = now_ts() - 86400
+    state["actions_log"]      = [t for t in state.get("actions_log",      []) if t >= cutoff_24h]
+    cutoff_30m = now_ts() - 1800
+    state["derby_burst_log"]  = [t for t in state.get("derby_burst_log",  []) if t >= cutoff_30m]
+    tmp = STATE_FILE.with_suffix(".tmp")
+    with tmp.open("w", encoding="utf-8") as f:
         json.dump(state, f, ensure_ascii=False, indent=2)
-
-
-# ── Pending drafts (DRY_RUN output) ──────────────────────────────────────────
-
-def load_pending() -> list:
-    """Load existing pending drafts; return empty list if file absent/corrupt."""
-    try:
-        with open(PENDING_FILE_PATH, "r", encoding="utf-8") as f:
-            return json.load(f)
-    except Exception:
-        return []
-
-
-def save_pending_draft(text: str, draft_type: str = "recovery") -> None:
-    """Append a generated draft to PENDING_FILE_PATH for human review.
-
-    Each entry records:
-      text         – the tweet that would have been posted
-      type         – draft category (always "recovery" in recovery mode)
-      generated_at – UTC ISO-8601 timestamp
-      status       – "pending" (unchanged until a human promotes/discards it)
-    """
-    PENDING_FILE_PATH.parent.mkdir(parents=True, exist_ok=True)
-    drafts = load_pending()
-    entry = {
-        "text":         text,
-        "type":         draft_type,
-        "generated_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-        "status":       "pending",
-    }
-    drafts.append(entry)
-    with open(PENDING_FILE_PATH, "w", encoding="utf-8") as f:
-        json.dump(drafts, f, ensure_ascii=False, indent=2)
-    log.info(
-        f"[DRAFT] Saved to {PENDING_FILE_PATH}  "
-        f"(total pending: {len(drafts)})"
-    )
-
-
-# ── Global Safety Governor ────────────────────────────────────────────────────
-
-def can_act(state: dict) -> bool:
-    """Return True only when ALL rate-limit constraints are satisfied.
-
-    Constraints (in evaluation order):
-      1. now >= state["next_action_after"]  (humanized extra gap, set after each post)
-      2. now - actions_log[-1] >= RATE_MIN_GAP  (≥10 min hard gap)
-      3. count(actions in last 1800s) < RATE_MAX_BURST  (≤3 in 30 min)
-      4. count(actions in last 3600s) < RATE_MAX_HOUR  (6/hr)
-      5. count(actions in last 86400s) < RATE_MAX_DAY  (25/day)
-    All constraints are HARD limits and cannot be bypassed.
-    """
-    now = time.time()
-    log_ts: list[float] = [t for t in state.get("actions_log", []) if now - t < 86400]
-    state["actions_log"] = log_ts  # prune in-memory copy
-
-    # 1. Humanized extra gap (set after each post to enforce 5–15 min beyond minimum)
-    next_after = state.get("next_action_after", 0.0)
-    if now < next_after:
-        wait_m = (next_after - now) / 60
-        log.info(f"Governor: humanized gap – wait {wait_m:.1f}m more – skip")
-        return False
-
-    # 2. Hard minimum gap (10 min)
-    if log_ts:
-        gap = now - log_ts[-1]
-        if gap < RATE_MIN_GAP:
-            log.info(f"Governor: gap {gap:.0f}s < {RATE_MIN_GAP}s – skip")
-            return False
-
-    # 3. Burst guard (≤3 in any 30-minute window)
-    burst_count = sum(1 for t in log_ts if now - t < RATE_BURST_WIN)
-    if burst_count >= RATE_MAX_BURST:
-        log.info(f"Governor: burst cap {burst_count}/{RATE_MAX_BURST} in 30 min – skip")
-        return False
-
-    # 4. Hourly cap
-    hour_count = sum(1 for t in log_ts if now - t < 3600)
-    if hour_count >= RATE_MAX_HOUR:
-        log.info(f"Governor: hourly cap {hour_count}/{RATE_MAX_HOUR} – skip")
-        return False
-
-    # 5. Daily cap
-    if len(log_ts) >= RATE_MAX_DAY:
-        log.info(f"Governor: daily cap {len(log_ts)}/{RATE_MAX_DAY} – skip")
-        return False
-
-    return True
+    tmp.replace(STATE_FILE)
 
 
 def record_action(state: dict) -> None:
-    """Append current timestamp, set humanized next-action window, and flush to disk."""
-    now = time.time()
-    state.setdefault("actions_log", []).append(now)
-    # Humanized extra delay: 5–15 min on top of the hard 10-min gap
+    """Log timestamp, set humanized next-action window, flush to disk."""
+    t = now_ts()
+    state.setdefault("actions_log", []).append(t)
+    state["last_action_ts"] = t
     extra = random.randint(HUMANIZE_EXTRA_LOW, HUMANIZE_EXTRA_HIGH)
-    state["next_action_after"] = now + RATE_MIN_GAP + extra
+    state["next_action_after"] = t + MIN_GAP_SECONDS + extra
     log.info(
-        f"Governor: next action window opens in "
-        f"{(RATE_MIN_GAP + extra) / 60:.1f} min "
+        f"Governor: next window in {(MIN_GAP_SECONDS + extra) / 60:.1f} min "
         f"(10 min gap + {extra // 60} min humanized delay)"
     )
     save_state(state)
 
 
-# ── API clients ───────────────────────────────────────────────────────────────
-
-def build_clients() -> tuple:
-    ai = OpenAI(api_key=OPENAI_API_KEY)
-    client = tweepy.Client(
-        consumer_key=X_API_KEY,
-        consumer_secret=X_API_SECRET,
-        access_token=X_ACCESS_TOKEN,
-        access_token_secret=X_ACCESS_SECRET,
-        wait_on_rate_limit=True,
-    )
-    return ai, client
+# ── Anti-spam governor ────────────────────────────────────────────────────────
 
 
-# ── AI reply generation ───────────────────────────────────────────────────────
+def governor_allows(state: dict, derby: bool = False) -> tuple[bool, str]:
+    """Return (True, 'ok') only when ALL constraints are satisfied.
 
-_STYLE_SEEDS: list[str] = [
-    "cache miss", "404 offside", "timeout", "ping spike", "hotfix",
-    "memory leak", "rollback", "null pointer", "stack overflow",
-    "server down", "patch update", "debug mode", "laggy VAR",
-    "cpu overload", "latency issue", "infinite loop", "merge conflict",
-    "rate limited", "buffer overflow", "garbage collected",
-    "deployment failed", "firewall breach", "kernel panic",
-]
+    Constraints (in order):
+      0. Humanized extra gap  (next_action_after)
+      1. Hard minimum gap     (≥10 min)
+      2. Hourly cap           (≤6 / hr)
+      3. Daily cap            (≤25 / day)
+      4. Derby burst cap      (≤3 in 30 min)  – only for derby events
+    """
+    now = now_ts()
+    log_ts = state.get("actions_log", [])
+    last   = state.get("last_action_ts", 0)
 
-# ── Dynamic system-prompt builder ─────────────────────────────────────────────
+    # 0. Humanized extra gap
+    next_after = state.get("next_action_after", 0.0)
+    if now < next_after:
+        wait_m = (next_after - now) / 60
+        return False, f"humanized_gap ({wait_m:.1f} min remaining)"
 
-def _build_system_prompt(
-    username: str,
-    event: str,
-    is_derby: bool,
-    lang: str,
-) -> str:
-    """Build a contextual system prompt tailored to club, event, and language."""
-    profile      = CLUB_PROFILES.get(username, {})
-    club_name    = profile.get("name", username)
-    personality  = profile.get("personality", "a regular club")
+    # 1. Hard minimum gap
+    if last and (now - last) < MIN_GAP_SECONDS:
+        return False, f"min_gap ({now - last}s < {MIN_GAP_SECONDS}s)"
 
-    # Language rule
-    if lang == "ar-sa":
-        lang_rule = (
-            "الرد يجب أن يكون باللهجة العربية السعودية فقط. "
-            "مسموح فقط بالمصطلحات التقنية بالإنجليزي (Bug, Lag, 404…). "
-            "ممنوع منعاً باتاً الردود الإنجليزية الكاملة."
-        )
-    else:
-        lang_rule = (
-            "Reply ONLY in English. "
-            "Do NOT switch to Arabic. "
-            "Tech terms may be English (Bug, Lag, 404…)."
-        )
+    # 2. Hourly cap
+    if sum(1 for t in log_ts if now - t < 3600) >= MAX_PER_HOUR:
+        return False, "hourly_cap"
 
-    # Event-mode instruction
-    event_instructions: dict[str, str] = {
-        "goal":     "⚽ EVENT: Goal scored – fast sarcastic celebration or mock surprise",
-        "win":      "🏅 EVENT: Win – celebratory sarcasm or mock the defeated rival's weakness",
-        "loss":     ("💥 EVENT — MELTDOWN MODE: heavy loss detected.\n"
-                     "Use dramatic failure metaphors: server crash · 404 defense · "
-                     "system collapse · critical bug · memory leak · kernel panic"),
-        "trophy":   ("🏆 EVENT — TROPHY MODE: championship won.\n"
-                     "Mock absent rivals. Legacy sarcasm. "
-                     "Treat history like open-source code nobody else can run."),
-        "conceded": "🚨 EVENT: Goal conceded – defensive failure sarcasm, VAR jokes",
-        "generic":  "⚽ General football moment – sharp sarcastic tech commentary",
-    }
-    event_block = event_instructions.get(event, event_instructions["generic"])
+    # 3. Daily cap
+    if len(log_ts) >= MAX_PER_DAY:
+        return False, "daily_cap"
 
-    # Derby boost
-    derby_block = ""
-    if is_derby:
-        derby_block = (
-            "\n🔥 DERBY MODE ACTIVE: this is a rivalry match. "
-            "Amplify sarcasm ×1.5 – maximum banter, still safe and clean."
-        )
+    # 4. Derby burst cap
+    if derby:
+        burst = state.get("derby_burst_log", [])
+        if sum(1 for t in burst if now - t < 1800) >= DERBY_BURST_MAX_30MIN:
+            return False, "derby_burst_cap"
 
-    return f"""\
-You are @BugKSA – a legendary autonomous football banter AI.
-Ratio: 80 % football banter + 20 % tech metaphors.
-Tone: sharp, witty, mocking, playful. NEVER abusive or hateful.
+    return True, "ok"
 
-🎭 Club personality for this reply:
-  {club_name} → {personality}
 
-🌍 Language rule (STRICT – breaking this = invalid reply):
-  {lang_rule}
+# ── OpenAI client ─────────────────────────────────────────────────────────────
 
-{event_block}{derby_block}
+ai = OpenAI(api_key=OPENAI_API_KEY)
 
-⚙️ Golden rules:
-- Output exactly ONE line, ≤260 characters
-- Use the provided style seed to vary the punchline
-- Allowed tech vocabulary: Lag · Timeout · Bug · 404 · Patch · Deployment failed ·
-  Memory leak · Server crash · Firewall breach · Cache clear · Kernel panic · Null pointer
-- FORBIDDEN: politics · religion · hate · harassment · doxxing · personal attacks
-- Mock teams and situations ONLY – never individuals personally
-- If the tweet is sensitive or ambiguous → give a safe evasive football joke
+# ── SYSTEM CONSTITUTION (BugKSA identity – non-negotiable) ───────────────────
 
-✅ Self-check before outputting (regenerate if any check fails):
-  1. Language matches the rule above
-  2. Club personality ({club_name}) is reflected
-  3. Event mode ({event}) is applied
-  4. Sarcasm is present
-  5. At least one tech metaphor/keyword is present
+SYSTEM_CONSTITUTION = """\
+You are @BugKSA – a Saudi football banter account. NOT a sports journalist. NOT a news bot.
+
+═══ IDENTITY (NON-NEGOTIABLE) ═══
+• Ratio: 80 % Saudi football sarcasm/طقطقة + 20 % tech metaphors
+• Tone: short · punchy · meme-like cadence – NEVER journalist-style or neutral analysis
+• Safe sarcasm ONLY: no hate, harassment, slurs, doxxing, sexual content, politics, religion
+
+═══ LANGUAGE RULE ═══
+• Reply in the SAME language as the target tweet
+• Arabic tweet → Saudi Arabic reply  (tech terms in English are OK: Bug, Lag, 404)
+• English tweet → English reply ONLY
+• NEVER mix languages in one reply
+
+═══ MANDATORY 3-PART STRUCTURE (all three required in every reply) ═══
+  PART 1 → TARGET/JAB    – aim the banter at the club, match, or situation
+  PART 2 → TECH METAPHOR – weave in ONE tech keyword naturally
+  PART 3 → PUNCHLINE     – land the joke: unexpected, sharp, meme-like ending
+
+  Example (Arabic):  "الدفاع crash كامل، والـ VAR بعد شايل null pointer 🤦‍♂️"
+  Example (English): "That defending just triggered a full server meltdown – 404 tactics not found 💀"
+
+═══ BANNED OUTPUT – regenerate immediately if any of these appear ═══
+  ✗ "Stats are crazy this season" or any neutral stats observation
+  ✗ "Impressive performance tonight" or any generic praise
+  ✗ "Both teams played well" – neutral = auto-rejected
+  ✗ Any sentence a sports journalist could write without embarrassment
+  ✗ More than ONE sentence (one punchy line only)
+  ✗ Hashtags (#) or @mentions
+
+═══ ALLOWED TECH VOCABULARY ═══
+  Lag · Timeout · Bug · 404 · Patch · Deployment failed · Memory leak ·
+  Server crash · Firewall breach · Cache clear · Kernel panic · Null pointer ·
+  CPU overload · Rollback · Hotfix · Debug mode · Ping spike ·
+  سيرفر · لاق · باق · تايم أوت · كاش
+
+═══ SELF-CHECK before outputting (regenerate if ANY fails) ═══
+  1. Language matches the target tweet
+  2. PART 1 (target/jab) is present
+  3. PART 2 (tech metaphor keyword) is present
+  4. PART 3 (punchline/meme ending) lands the joke
+  5. ZERO journalist phrasing or neutral analysis
   6. Content is safe and clean
+  7. Single punchy line ≤240 characters
 """
 
-
-# ── Generation quality validator ──────────────────────────────────────────────
-
-_TECH_KEYWORDS = {
-    "lag", "timeout", "bug", "404", "patch", "server", "crash", "firewall",
-    "cache", "deployment", "memory", "leak", "loop", "null", "error", "stack",
-    "overflow", "hotfix", "debug", "kernel", "panic", "cpu", "buffer", "ping",
-    "سيرفر", "لاق", "باق",
-}
-
-
-def _validate_reply(reply: str, lang: str, event: str) -> tuple[bool, str]:
-    """Basic generation quality check. Returns (passed, fail_reason)."""
-    if len(reply) < 15:
-        return False, "reply too short"
-
-    lower = reply.lower()
-
-    # Must contain at least one tech keyword
-    if not any(kw in lower for kw in _TECH_KEYWORDS):
-        return False, "no tech metaphor"
-
-    # Meltdown / trophy mode: prefer dramatic language (soft check only – log warning)
-    if event == "loss":
-        heavy_terms = {"crash", "404", "collapse", "leak", "panic", "null", "bug"}
-        if not any(t in lower for t in heavy_terms):
-            log.debug("Meltdown mode: soft check – missing heavy failure term")
-
-    # Hard forbidden content check
-    forbidden = {"hate", "terrorist", "bomb", "kill", "attack"}
-    if any(w in lower for w in forbidden):
-        return False, "forbidden content detected"
-
-    return True, ""
+# Style seeds drive creative variety
+_STYLE_SEEDS_AR: list[str] = [
+    "طقطقة خفيفة مع قفلة سعودية",
+    "مقلب تقني على الدفاع",
+    "سخرية كروية سريعة",
+    "ذبة قصيرة وتمون",
+    "نفس مشجع فاصل بعد مباراة",
+]
+_STYLE_SEEDS_EN: list[str] = [
+    "short savage banter",
+    "cold tech roast",
+    "dry sarcastic jab",
+    "football meme energy",
+    "one-liner troll",
+]
 
 
-# ── AI reply generation ───────────────────────────────────────────────────────
-
-def generate_reply(
-    ai: OpenAI,
-    tweet_text: str,
-    style_seed: str,
-    *,
-    username: str = "",
-    event: str = "generic",
-    is_derby: bool = False,
-    lang: str = "en",
-) -> str:
-    """Generate a contextual sarcastic reply with up to 3 self-validation retries."""
-    system   = _build_system_prompt(username, event, is_derby, lang)
-    user_msg = f"Style seed: '{style_seed}'\n\nTweet:\n{tweet_text}"
-
+def generate_reply(tweet_text: str, lang_hint: str = "en") -> str:
+    """Generate a banter reply, retrying up to 3 times until quality_ok() passes."""
+    seed = random.choice(_STYLE_SEEDS_AR if lang_hint == "ar" else _STYLE_SEEDS_EN)
+    user_prompt = (
+        f"Style seed: {seed}\n\n"
+        f"Target tweet:\n{tweet_text}\n\n"
+        "Write ONE reply tweet now. "
+        "Must follow the 3-part structure: "
+        "(1) jab at the club/situation  (2) tech metaphor  (3) sharp meme-like punchline."
+    )
     for attempt in range(3):
         try:
             resp = ai.chat.completions.create(
                 model=OPENAI_MODEL,
                 messages=[
-                    {"role": "system", "content": system},
-                    {"role": "user",   "content": user_msg},
+                    {"role": "system", "content": SYSTEM_CONSTITUTION},
+                    {"role": "user",   "content": user_prompt},
                 ],
-                temperature=min(0.92 + attempt * 0.05, 1.1),
-                max_completion_tokens=100,
+                temperature=min(0.90 + attempt * 0.05, 1.1),
+                max_completion_tokens=120,
             )
-            text  = resp.choices[0].message.content.strip()
-            reply = " ".join(text.splitlines()).strip()[:260]
+            text  = (resp.choices[0].message.content or "").strip()
+            reply = " ".join(text.splitlines()).strip()[:240]
 
-            ok, reason = _validate_reply(reply, lang, event)
-            if ok:
+            if quality_ok(reply):
                 if attempt > 0:
-                    log.info(f"Generation check: passed on attempt {attempt + 1}")
+                    log.info(f"Identity gate: passed on attempt {attempt + 1}")
                 return reply
 
-            log.info(f"Generation check fail (attempt {attempt + 1}/{3}): {reason} → retrying")
+            log.info(f"Identity gate: attempt {attempt + 1}/3 failed quality_ok → retrying")
         except Exception as e:
-            log.warning(f"OpenAI generate_reply error (attempt {attempt + 1}): {e}")
+            log.warning(f"OpenAI error (attempt {attempt + 1}): {e}")
 
-    # Fallback – guaranteed to be safe
-    if lang == "ar-sa":
+    # Fallback – guaranteed to be safe and on-brand
+    if lang_hint == "ar":
         return "VAR راجع الحركة… السيرفر وقف. ⚽🤖"
     return "VAR stuck in an infinite loop – system timeout. ⚽🤖"
 
 
-def generate_recovery_tweet(ai: OpenAI) -> str:
-    """Harmless human-like football status update for recovery mode.
-    No links, no hashtags, no mentions."""
-    topics = [
-        "watching a match tonight",
-        "thinking about last night's game",
-        "impressive football statistics",
-        "waiting for the weekend fixtures",
-        "a classic goal I still remember",
-        "how tactics have changed in modern football",
-        "that feeling when your team scores late",
-    ]
-    prompt = (
-        f"Write a single casual, human-sounding football status tweet about: "
-        f"{random.choice(topics)}. "
-        "Rules: no links, no hashtags, no @mentions, max 200 characters, "
-        "sound like a genuine football fan, one sentence only."
-    )
-    try:
-        resp = ai.chat.completions.create(
-            model=OPENAI_MODEL,
-            messages=[{"role": "user", "content": prompt}],
-            temperature=0.88,
-            max_completion_tokens=80,
-        )
-        text = resp.choices[0].message.content.strip()
-        return " ".join(text.splitlines()).strip()[:200]
-    except Exception as e:
-        log.warning(f"OpenAI generate_recovery_tweet error: {e}")
-        return "Football: where logic goes to retire. ⚽"
+def detect_arabic(text: str) -> bool:
+    return bool(re.search(r"[\u0600-\u06FF]", text))
 
 
-# ── Tweet eligibility filter ──────────────────────────────────────────────────
+# ── X / Twitter client ────────────────────────────────────────────────────────
 
-_LINK_RE    = re.compile(r"https?://\S+|t\.co/\S+", re.IGNORECASE)
-_MENTION_RE = re.compile(r"@\w+")
-
-
-def is_eligible_club_tweet(tweet) -> tuple[bool, str]:
-    """Return (eligible, reason_if_rejected).
-
-    Rejects:
-      - Retweets (text prefix or referenced_tweets type)
-      - Quote tweets (referenced_tweets type)
-      - Tweets containing any URL/link
-      - Tweets shorter than 8 characters (after stripping links)
-      - Tweets with 3 or more @mentions
-    """
-    text: str = tweet.text or ""
-
-    # Retweet (text-level)
-    if text.startswith("RT "):
-        return False, "retweet prefix"
-
-    # Quote tweet or retweet via referenced_tweets API field
-    refs = getattr(tweet, "referenced_tweets", None)
-    if refs:
-        for ref in refs:
-            ref_type = getattr(ref, "type", "")
-            if ref_type in ("quoted", "retweeted"):
-                return False, f"referenced_tweet type={ref_type}"
-
-    # Any link → skip (likely ad or self-promo)
-    if _LINK_RE.search(text):
-        return False, "contains link/url"
-
-    # Too short
-    clean = _LINK_RE.sub("", text).strip()
-    if len(clean) < 8:
-        return False, f"too short ({len(clean)} chars)"
-
-    # 3+ @mentions → likely a thread reply / ad
-    if len(_MENTION_RE.findall(text)) >= 3:
-        return False, f"too many mentions ({len(_MENTION_RE.findall(text))})"
-
-    return True, ""
+x = tweepy.Client(
+    consumer_key=X_API_KEY,
+    consumer_secret=X_API_SECRET,
+    access_token=X_ACCESS_TOKEN,
+    access_token_secret=X_ACCESS_SECRET,
+    wait_on_rate_limit=True,
+)
 
 
-# ── Post wrappers ─────────────────────────────────────────────────────────────
-
-def post_reply(
-    client: tweepy.Client, text: str, reply_to_id: str, state: dict
-) -> bool:
+def post_reply(state: dict, in_reply_to_tweet_id: int, text: str) -> None:
     if DRY_RUN:
-        log.info(f"[DRY_RUN] Would reply to {reply_to_id}: {text!r}")
+        log.info(f"[DRY_RUN] Would reply to {in_reply_to_tweet_id}: {text}")
         record_action(state)
-        return True
-    try:
-        client.create_tweet(text=text, in_reply_to_tweet_id=reply_to_id, user_auth=True)
-        record_action(state)
-        log.info(f"✅ Replied to {reply_to_id}: {text!r}")
-        return True
-    except Exception as e:
-        log.error(f"create_tweet (reply) failed: {e}")
-        return False
+        return
+    x.create_tweet(text=text, in_reply_to_tweet_id=in_reply_to_tweet_id, user_auth=True)
+    record_action(state)
 
 
-def post_tweet(client: tweepy.Client, text: str, state: dict) -> bool:
+def post_tweet(state: dict, text: str) -> None:
     if DRY_RUN:
-        log.info("[DRY_RUN] create_tweet SKIPPED (DRY_RUN=true) — draft already saved to pending.json")
+        log.info(f"[DRY_RUN] Would tweet: {text}")
         record_action(state)
-        return True
-    try:
-        client.create_tweet(text=text, user_auth=True)
-        record_action(state)
-        log.info(f"✅ Tweeted: {text!r}")
-        return True
-    except Exception as e:
-        log.error(f"create_tweet (status) failed: {e}")
-        return False
+        return
+    x.create_tweet(text=text, user_auth=True)
+    record_action(state)
 
 
-# ── Bot identity & target resolution ─────────────────────────────────────────
-
-def get_bot_identity(client: tweepy.Client) -> tuple[str, str]:
-    me = client.get_me(user_auth=True)
-    return str(me.data.id), str(me.data.username)
+# ── Helpers ───────────────────────────────────────────────────────────────────
 
 
-def resolve_target_ids(
-    client: tweepy.Client, usernames: list[str]
-) -> dict[str, str]:
-    """Return {username: user_id}. Logs but does not abort on failures."""
-    result: dict[str, str] = {}
-    for username in usernames:
+def resolve_user_ids(usernames: dict[str, dict]) -> dict[str, dict]:
+    resolved: dict[str, dict] = {}
+    for uname, meta in usernames.items():
         try:
-            r = client.get_user(username=username, user_auth=True)
-            if r and r.data:
-                result[username] = str(r.data.id)
-                log.info(f"  @{username} → id={r.data.id}")
+            u = x.get_user(username=uname, user_auth=True)
+            if u and u.data:
+                resolved[uname] = {**meta, "id": str(u.data.id)}
+            else:
+                log.warning(f"Could not resolve @{uname}")
         except Exception as e:
-            log.warning(f"  @{username}: resolve failed – {e}")
-    return result
+            log.warning(f"resolve @{uname}: {e}")
+    return resolved
 
 
-# ── Mentions mode ─────────────────────────────────────────────────────────────
-
-def run_mentions_mode(
-    client: tweepy.Client, ai: OpenAI, my_id: str, state: dict
-) -> bool:
-    """Process at most 1 mention per cycle. Returns True if an action was taken."""
-    replied_set = set(state.get("replied_tweet_ids", []))
-
-    try:
-        resp = client.get_users_mentions(
-            id=my_id,
-            since_id=state.get("last_mention_id"),
-            user_auth=True,
-            max_results=10,
-            tweet_fields=["id", "text", "author_id"],
-        )
-    except Exception as e:
-        log.warning(f"Mentions fetch error: {e}")
-        return False
-
-    if not resp or not resp.data:
-        log.info("Mentions: none new")
-        return False
-
-    # Always advance the cursor so old mentions are not reprocessed after restart
-    if resp.meta and resp.meta.get("newest_id"):
-        state["last_mention_id"] = resp.meta["newest_id"]
-
-    # Process at most 1 per cycle
-    for item in resp.data[:1]:
-        tid = str(item.id)
-        if tid in replied_set:
-            log.info(f"Mention {tid}: already replied – skip")
-            continue
-
-        # Humanization: intentionally skip ~40% of opportunities
-        if random.random() < HUMANIZE_SKIP_RATE:
-            log.info(f"Mention {tid}: humanized skip (40% chance) – will retry next cycle")
-            return False
-
-        if not can_act(state):
-            return False
-
-        seed  = random.choice(_STYLE_SEEDS)
-        event = detect_event(item.text)
-        reply = generate_reply(
-            ai, item.text, seed,
-            event=event, lang="ar-sa",  # mentions default to Saudi Arabic
-        )
-        log.info(f"Mention {tid}: replying (seed={seed!r}, event={event})")
-        if post_reply(client, reply, tid, state):
-            replied_set.add(tid)
-            state["replied_tweet_ids"] = list(replied_set)
-            save_state(state)
-            return True
-
-    return False
-
-
-# ── Sniping mode ──────────────────────────────────────────────────────────────
-
-def run_sniping_mode(
-    client: tweepy.Client,
-    ai: OpenAI,
-    target_ids: dict[str, str],
-    state: dict,
-) -> bool:
-    """Try to reply to ONE eligible tweet from ONE target per cycle.
-    Returns True if an action was taken."""
-    replied_set = set(state.get("replied_tweet_ids", []))
-    now = time.time()
-
-    targets = list(target_ids.items())
-    random.shuffle(targets)  # avoid always hitting the same account first
-
-    for username, uid in targets:
-        # Per-target 4-hour cooldown (allows broader coverage across all clubs)
-        last_acted = state.get("target_last_acted", {}).get(username, 0.0)
-        if now - last_acted < 14400:
-            remaining_h = (14400 - (now - last_acted)) / 3600
-            log.info(f"Snipe @{username}: cooldown {remaining_h:.1f}h remaining – skip")
-            continue
-
-        since_id = state.get("last_seen_by_target", {}).get(username)
-        try:
-            result = client.get_users_tweets(
-                id=uid,
-                since_id=since_id,
-                user_auth=True,
-                max_results=5,
-                exclude=["retweets", "replies"],
-                tweet_fields=["id", "text", "referenced_tweets"],
-            )
-        except Exception as e:
-            log.warning(f"Snipe @{username}: fetch error – {e}")
-            continue
-
-        if not result or not result.data:
-            log.info(f"Snipe @{username}: no new tweets")
-            continue
-
-        # Advance cursor for this target
-        if result.meta and result.meta.get("newest_id"):
-            state.setdefault("last_seen_by_target", {})[username] = result.meta["newest_id"]
-
-        for tweet in result.data:
-            tid = str(tweet.id)
-            if tid in replied_set:
-                log.info(f"Snipe @{username} {tid}: already replied – skip")
-                continue
-
-            eligible, reason = is_eligible_club_tweet(tweet)
-            if not eligible:
-                log.info(f"Snipe @{username} {tid}: ineligible ({reason})")
-                continue
-
-            # Humanization: intentionally skip ~40% of opportunities
-            if random.random() < HUMANIZE_SKIP_RATE:
-                log.info(f"Snipe @{username} {tid}: humanized skip – will retry next cycle")
-                continue
-
-            if not can_act(state):
-                return False
-
-            seed      = random.choice(_STYLE_SEEDS)
-            event     = detect_event(tweet.text)
-            is_derby  = detect_derby(username, tweet.text)
-            lang      = CLUB_PROFILES.get(username, {}).get("lang", "en")
-            reply = generate_reply(
-                ai, tweet.text, seed,
-                username=username,
-                event=event,
-                is_derby=is_derby,
-                lang=lang,
-            )
-            log.info(
-                f"Snipe @{username} {tid}: replying "
-                f"(event={event}, derby={is_derby}, lang={lang}, seed={seed!r})"
-            )
-            if post_reply(client, reply, tid, state):
-                replied_set.add(tid)
-                state["replied_tweet_ids"] = list(replied_set)
-                state.setdefault("target_last_acted", {})[username] = now
-                save_state(state)
-                return True  # one action per cycle; stop here
-
-    return False
+def is_derby(tweet_text: str) -> bool:
+    t = tweet_text.lower()
+    return any(a.lower() in t and b.lower() in t for a, b in RIVAL_PAIRS)
 
 
 # ── Recovery mode ─────────────────────────────────────────────────────────────
 
-def run_recovery_mode(client: tweepy.Client, ai: OpenAI, state: dict) -> bool:
-    """Post one harmless status tweet when within recovery limits.
-    Replies are completely disabled in recovery mode.
-    Returns True if an action was taken."""
-    now = time.time()
-    rec_log: list[float] = [
-        t for t in state.get("recovery_tweets_log", []) if now - t < 86400
-    ]
-    state["recovery_tweets_log"] = rec_log
 
-    # Recovery daily cap
-    if len(rec_log) >= RECOVERY_MAX_DAY:
-        log.info(f"Recovery: daily cap {len(rec_log)}/{RECOVERY_MAX_DAY} – skip")
-        return False
+def run_recovery_mode(state: dict) -> None:
+    """Post one safe banter tweet in low-frequency mode. Replies disabled."""
+    ok, reason = governor_allows(state, derby=False)
+    if not ok:
+        log.info(f"Recovery: skip – {reason}")
+        return
 
-    # Recovery minimum gap (2 hours)
-    if rec_log:
-        gap = now - rec_log[-1]
-        if gap < RECOVERY_MIN_GAP:
-            log.info(f"Recovery: gap {gap/3600:.1f}h < {RECOVERY_MIN_GAP/3600:.0f}h – skip")
-            return False
+    base = "الدوري هذا كأنه سيرفر تحت ضغط… اللي دفاعه يهنق لا يلوم إلا نفسه."
+    reply = ""
+    for attempt in range(3):
+        cand = generate_reply(base, lang_hint="ar")
+        if quality_ok(cand):
+            reply = cand
+            break
+        log.info(f"Recovery: quality_ok fail attempt {attempt + 1} → retrying")
 
-    # Global governor also applies
-    if not can_act(state):
-        return False
+    if not reply:
+        log.info("Recovery: no quality draft – skipping")
+        return
 
-    text = generate_recovery_tweet(ai)
+    log.info(f"Recovery posting: {reply}")
+    post_tweet(state, reply)
 
-    # Always log the draft clearly so it is visible in Railway logs
-    log.info(f"[DRAFT] Recovery tweet generated ──────────────────────────")
-    log.info(f"[DRAFT] {text!r}")
-    log.info(f"[DRAFT] ────────────────────────────────────────────────────")
-
-    # In dry-run, save to pending.json for human review; never call create_tweet
-    if DRY_RUN:
-        save_pending_draft(text, draft_type="recovery")
-
-    if post_tweet(client, text, state):
-        state["recovery_tweets_log"].append(now)
-        save_state(state)
-        return True
-
-    return False
+    silence_h = random.randint(*RECOVERY_SILENCE_H)
+    log.info(f"Recovery: silence window {silence_h}h")
+    time.sleep(silence_h * 3600)
 
 
-# ── Persistent storage probe ──────────────────────────────────────────────────
-
-def probe_data_dir() -> None:
-    """Verify the data directory is writable, then seed missing data files.
-
-    1. Writes and removes a sentinel file to confirm write access.
-       Fails fast (sys.exit) if the Railway Volume is not mounted so the
-       bot never silently writes to an ephemeral container layer.
-    2. Creates state.json and pending.json with empty defaults on first run
-       so their presence on the Volume is immediately visible after deploy.
-    """
-    data_dir = STATE_FILE_PATH.parent
-    sentinel = data_dir / ".write_probe"
-    try:
-        data_dir.mkdir(parents=True, exist_ok=True)
-        sentinel.write_text("ok")
-        sentinel.unlink()
-    except OSError as exc:
-        log.error(
-            f"Storage probe FAILED: cannot write to {data_dir}\n"
-            f"  {exc}\n"
-            f"  → Create a Railway Volume named 'bot_data' and mount it at /app/data\n"
-            f"    CLI: railway volume create bot_data\n"
-            f"         railway volume mount bot_data --service <id> --mount-path /app/data"
-        )
-        sys.exit(1)
-
-    log.info(f"Storage probe: {data_dir} is writable")
-
-    # ── First-run file initialisation ────────────────────────────────────────
-    if not STATE_FILE_PATH.exists():
-        default_state: dict = {
-            "last_mention_id":     None,
-            "last_seen_by_target": {},
-            "replied_tweet_ids":   [],
-            "actions_log":         [],
-            "target_last_acted":   {},
-            "recovery_tweets_log": [],
-            "next_action_after":   0.0,
-        }
-        STATE_FILE_PATH.write_text(
-            json.dumps(default_state, ensure_ascii=False, indent=2),
-            encoding="utf-8",
-        )
-        log.info(f"  Created {STATE_FILE_PATH} (first run)")
-
-    if not PENDING_FILE_PATH.exists():
-        PENDING_FILE_PATH.parent.mkdir(parents=True, exist_ok=True)
-        PENDING_FILE_PATH.write_text("[]", encoding="utf-8")
-        log.info(f"  Created {PENDING_FILE_PATH} (first run)")
+# ── Main loop ─────────────────────────────────────────────────────────────────
 
 
-# ── Entry point ───────────────────────────────────────────────────────────────
-
-def main() -> None:
-    log.info("=" * 60)
-    log.info("BugKSA Bot – Starting up")
-    log.info("=" * 60)
-
-    validate_env()
-    probe_data_dir()
-
-    log.info(f"  DRY_RUN       : {DRY_RUN}  {'← no posts will reach X' if DRY_RUN else '← LIVE posting enabled'}")
-    log.info(f"  RECOVERY_MODE : {RECOVERY_MODE}  {'← replies/sniping disabled' if RECOVERY_MODE else '← full mode'}")
-    log.info(f"  OPENAI_MODEL  : {OPENAI_MODEL}")
-    log.info(f"  STATE_FILE    : {STATE_FILE_PATH}")
-    log.info(f"  PENDING_FILE  : {PENDING_FILE_PATH}  {'← drafts written here' if DRY_RUN else '← not used (DRY_RUN=false)'}")
-    log.info(
-        f"  Rate limits   : gap≥{RATE_MIN_GAP//60}min | burst≤{RATE_MAX_BURST}/30min | "
-        f"{RATE_MAX_HOUR}/hr | {RATE_MAX_DAY}/day | skip={int(HUMANIZE_SKIP_RATE*100)}%"
-    )
-    log.info(f"  Recovery caps : {RECOVERY_MAX_DAY}/day | gap≥{RECOVERY_MIN_GAP//3600}h")
-    log.info(f"  Targets       : {len(TARGET_USERNAMES)} club accounts (inactive in recovery mode)")
-
-    ai, client = build_clients()
+def monitor_mentions_and_snipes() -> None:
     state = load_state()
+    replied_set: set[str] = set(state.get("replied_tweet_ids", []))
 
-    try:
-        my_id, my_username = get_bot_identity(client)
-        log.info(f"  Bot identity  : @{my_username} (id={my_id})")
-    except Exception as e:
-        log.error(f"Twitter authentication failed: {e}")
-        sys.exit(1)
-
-    target_ids: dict[str, str] = {}
-    if not RECOVERY_MODE:
-        log.info("Resolving target account IDs …")
-        target_ids = resolve_target_ids(client, TARGET_USERNAMES)
-        log.info(f"Resolved {len(target_ids)}/{len(TARGET_USERNAMES)} targets.")
+    me = x.get_me(user_auth=True)
+    if not me or not me.data:
+        raise RuntimeError("Failed to get authenticated user – check X API keys")
+    my_id = me.data.id
 
     log.info("=" * 60)
-    log.info("Poll loop starting …")
+    log.info(f"BugKSA online  my_id={my_id}  DRY_RUN={DRY_RUN}  RECOVERY_MODE={RECOVERY_MODE}")
+    log.info(
+        f"Governor: gap≥{MIN_GAP_SECONDS // 60}min | burst≤{DERBY_BURST_MAX_30MIN}/30min | "
+        f"{MAX_PER_HOUR}/hr | {MAX_PER_DAY}/day | humanize_skip={int(HUMANIZE_SKIP_RATE * 100)}%"
+    )
+    log.info("=" * 60)
+
+    targets = resolve_user_ids(TARGET_USERNAMES)
+    log.info(f"Resolved {len(targets)}/{len(TARGET_USERNAMES)} targets.")
 
     cycle = 0
     while True:
         cycle += 1
         log.info(f"── Cycle {cycle} " + "─" * 40)
+        did_action = False
 
-        acted = False
+        try:
+            if RECOVERY_MODE:
+                run_recovery_mode(state)
+                continue
 
-        if RECOVERY_MODE:
-            # Replies disabled; only harmless status tweets
-            acted = run_recovery_mode(client, ai, state)
-        else:
-            # Normal mode: mentions first, then sniping
-            acted = run_mentions_mode(client, ai, my_id, state)
-            if not acted:
-                acted = run_sniping_mode(client, ai, target_ids, state)
+            # ── 1. Mentions ───────────────────────────────────────────────────
+            mentions = x.get_users_mentions(
+                id=my_id,
+                since_id=state.get("last_mention_id"),
+                max_results=10,
+                user_auth=True,
+            )
+            if mentions and mentions.data:
+                if mentions.meta and mentions.meta.get("newest_id"):
+                    state["last_mention_id"] = mentions.meta["newest_id"]
 
-        if not acted:
+                for tw in mentions.data[:1]:  # at most 1 per cycle
+                    tid = str(tw.id)
+                    if tid in replied_set:
+                        log.info(f"Mention {tid}: already replied – skip")
+                        continue
+
+                    # Humanize: intentionally skip 40 % of opportunities
+                    if random.random() < HUMANIZE_SKIP_RATE:
+                        log.info(f"Mention {tid}: humanized skip – will retry next cycle")
+                        continue
+
+                    derby = is_derby(tw.text)
+                    ok, reason = governor_allows(state, derby=derby)
+                    if not ok:
+                        log.info(f"Mention {tid}: governor – {reason}")
+                        break
+
+                    lang_hint = "ar" if detect_arabic(tw.text) else "en"
+                    reply = ""
+                    for attempt in range(3):
+                        cand = generate_reply(tw.text, lang_hint=lang_hint)
+                        if quality_ok(cand):
+                            reply = cand
+                            break
+                        log.info(f"Mention {tid} quality_ok fail attempt {attempt + 1} → retrying")
+
+                    if not reply:
+                        log.info(f"Mention {tid}: no quality reply after 3 attempts – skip")
+                        replied_set.add(tid)
+                        state["replied_tweet_ids"].append(tid)
+                        save_state(state)
+                        continue
+
+                    log.info(f"Mention {tid}: replying → {reply}")
+                    post_reply(state, tw.id, reply)
+                    replied_set.add(tid)
+                    state["replied_tweet_ids"].append(tid)
+                    if derby:
+                        state["derby_burst_log"].append(now_ts())
+                    save_state(state)
+                    did_action = True
+
+            # ── 2. Club radar (sniping) ───────────────────────────────────────
+            for uname, meta in targets.items():
+                uid = meta.get("id")
+                if not uid:
+                    continue
+
+                last_seen = state["last_seen_by_user"].get(uid)
+                tweets = x.get_users_tweets(
+                    id=uid,
+                    since_id=last_seen,
+                    max_results=5,
+                    user_auth=True,
+                )
+                if not tweets or not tweets.data:
+                    continue
+
+                if tweets.meta and tweets.meta.get("newest_id"):
+                    state["last_seen_by_user"][uid] = tweets.meta["newest_id"]
+
+                for tw in tweets.data:
+                    tid = str(tw.id)
+                    if tid in replied_set:
+                        continue
+                    if tw.text.strip().startswith("RT"):
+                        continue
+                    if tw.text.count("http") >= 2:
+                        replied_set.add(tid)
+                        state["replied_tweet_ids"].append(tid)
+                        save_state(state)
+                        continue
+
+                    # Humanize: intentionally skip 40 % of opportunities
+                    if random.random() < HUMANIZE_SKIP_RATE:
+                        log.info(f"Snipe @{uname} {tid}: humanized skip")
+                        continue
+
+                    derby = is_derby(tw.text)
+                    ok, reason = governor_allows(state, derby=derby)
+                    if not ok:
+                        log.info(f"Snipe @{uname}: governor – {reason}")
+                        break
+
+                    lang_hint = "ar" if detect_arabic(tw.text) else "en"
+                    reply = ""
+                    for attempt in range(3):
+                        cand = generate_reply(tw.text, lang_hint=lang_hint)
+                        if quality_ok(cand):
+                            reply = cand
+                            break
+                        log.info(f"Snipe @{uname} quality_ok fail attempt {attempt + 1} → retrying")
+
+                    if not reply:
+                        log.info(f"Snipe @{uname}: no quality reply – skip")
+                        replied_set.add(tid)
+                        state["replied_tweet_ids"].append(tid)
+                        save_state(state)
+                        continue
+
+                    log.info(f"Snipe @{uname}: replying → {reply}")
+                    post_reply(state, tw.id, reply)
+                    replied_set.add(tid)
+                    state["replied_tweet_ids"].append(tid)
+                    if derby:
+                        state["derby_burst_log"].append(now_ts())
+                    save_state(state)
+                    did_action = True
+
+        except Exception as e:
+            log.error(f"Cycle error: {e}")
+            time.sleep(60)
+            continue
+
+        if not did_action:
             log.info("Cycle complete: no action taken.")
 
-        save_state(state)
-
-        sleep_s = random.randint(300, 600)  # 5–10 min poll cycle
+        # Cycle sleep: 5-10 min
+        sleep_s = random.randint(300, 600)
         log.info(f"Sleeping {sleep_s}s ({sleep_s // 60}m {sleep_s % 60}s) …")
         time.sleep(sleep_s)
 
 
 if __name__ == "__main__":
-    main()
+    monitor_mentions_and_snipes()
