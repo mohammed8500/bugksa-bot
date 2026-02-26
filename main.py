@@ -97,6 +97,124 @@ TARGET_USERNAMES: list[str] = [
     "Atleti",
 ]
 
+# ── Club personality profiles ─────────────────────────────────────────────────
+# lang: "ar-sa" → Saudi Arabic reply  |  "en" → English reply
+CLUB_PROFILES: dict[str, dict] = {
+    # Saudi Pro League ─────────────────────────────────────────────────────────
+    "Alhilal_FC":    {"name": "الهلال",         "lang": "ar-sa",
+                      "personality": "يتحدث من مركز التفوق المطلق كأنه يملك الدوري بالوراثة"},
+    "AlNassrFC":     {"name": "النصر",           "lang": "ar-sa",
+                      "personality": "مبني على الضجة والاحتفال المسبق، يعيش على المبالغة"},
+    "ittihad":       {"name": "الاتحاد",         "lang": "ar-sa",
+                      "personality": "فوضى منظمة، ديناميكية عاطفية، مسرح درامي من الدرجة الأولى"},
+    "ALAHLI_FC":     {"name": "الأهلي",          "lang": "ar-sa",
+                      "personality": "يختفي ثم يعود بقوة، بطل الكوميباك الأبدي"},
+    "AlQadsiah":     {"name": "القادسية",        "lang": "ar-sa",
+                      "personality": "مفاجأة الدوري، يظهر فجأة في القمة ثم يختفي كـ cache مؤقت"},
+    "AlShabab_FC":   {"name": "الشباب",          "lang": "ar-sa",
+                      "personality": "الفريق الذي يُعطي وعوداً أكثر من مسؤول تقني"},
+    "AlFaisaly_FC":  {"name": "الفيصلي",        "lang": "ar-sa",
+                      "personality": "تراث عريق لكن حظه يُشبه سيرفراً قديماً"},
+    "AlTaawon_FC":   {"name": "التعاون",         "lang": "ar-sa",
+                      "personality": "دائماً في المنتصف، لا صعود ولا هبوط، safe mode دائم"},
+    "AlFatehFC":     {"name": "الفتح",           "lang": "ar-sa",
+                      "personality": "ينام في الدوري ويصحى فجأة على الكأس"},
+    "AlRaedFC":      {"name": "الرائد",          "lang": "ar-sa",
+                      "personality": "يكافح البقاء كل موسم كأنه loop لا ينتهي"},
+    # Saudi sports media
+    "Hadaf_SA":      {"name": "هدف",             "lang": "ar-sa",
+                      "personality": "يتابع الأخبار قبل حدوثها، سيرفر الأخبار الكروية"},
+    "kooora":        {"name": "كووورة",           "lang": "ar-sa",
+                      "personality": "الحكم الأول والأخير في الإنترنت الكروي العربي"},
+    # English Premier League ───────────────────────────────────────────────────
+    "ManUtd":        {"name": "Man United",       "lang": "en",
+                      "personality": "living off Sir Alex's legacy like deprecated code nobody dares delete"},
+    "Arsenal":       {"name": "Arsenal",          "lang": "en",
+                      "personality": "always close to the title, always buffer overflow at the end"},
+    "ChelseaFC":     {"name": "Chelsea",          "lang": "en",
+                      "personality": "fires managers faster than an auto-deployment pipeline"},
+    "SpursOfficial": {"name": "Spurs",            "lang": "en",
+                      "personality": "brilliant in the first leg, crashes in the second like a beta server"},
+    "LCFC":          {"name": "Leicester",        "lang": "en",
+                      "personality": "one legendary patch release and then legacy mode forever"},
+    "Everton":       {"name": "Everton",          "lang": "en",
+                      "personality": "fighting relegation bravely every season, eternal survival mode"},
+    "WestHam":       {"name": "West Ham",         "lang": "en",
+                      "personality": "a whole city runs on football dreams and late goals"},
+    "Wolves":        {"name": "Wolves",           "lang": "en",
+                      "personality": "surprise compiler that never fully commits"},
+    # European heavy-weights ───────────────────────────────────────────────────
+    "realmadrid":    {"name": "Real Madrid",      "lang": "en",
+                      "personality": "scripted destiny – the universe is literally running their matchday cron job"},
+    "FCBarcelona":   {"name": "Barcelona",        "lang": "en",
+                      "personality": "obsessed with tiki-taka like a dev who caches everything and scores nothing"},
+    "ManCity":       {"name": "Man City",         "lang": "en",
+                      "personality": "petrodollar-powered machine: technically perfect, emotionally zero"},
+    "LFC":           {"name": "Liverpool",        "lang": "en",
+                      "personality": "lifts a trophy then emotionally collapses for two seasons straight"},
+    "juventusfc":    {"name": "Juventus",         "lang": "en",
+                      "personality": "Serie A's grandfather – still runs on Windows XP"},
+    "PSG_inside":    {"name": "PSG",              "lang": "en",
+                      "personality": "buys every star but can't find a working team.exe"},
+    "FCBayern":      {"name": "Bayern",           "lang": "en",
+                      "personality": "crushes the Bundesliga then gets a 500 Internal Error in Europe"},
+    "BVB":           {"name": "Dortmund",         "lang": "en",
+                      "personality": "terrifies you in the first leg then throws a NullPointerException in the second"},
+    "Atleti":        {"name": "Atlético",         "lang": "en",
+                      "personality": "parks the bus so hard even the VAR system can't find the attack folder"},
+}
+
+# ── Rivalry pairs (derby detection) ──────────────────────────────────────────
+RIVALRY_PAIRS: list[tuple[str, str]] = [
+    ("Alhilal_FC", "AlNassrFC"),    # الكلاسيكو السعودي
+    ("ittihad",    "ALAHLI_FC"),    # ديربي جدة
+    ("LFC",        "ManCity"),      # Liverpool–City
+    ("realmadrid", "FCBarcelona"),  # El Clásico
+    ("ManUtd",     "Arsenal"),      # historic PL rivalry
+    ("ManUtd",     "LFC"),          # North-West derby
+    ("realmadrid", "Atleti"),       # Madrid derby
+    ("juventusfc", "FCBarcelona"),  # Juve–Barca
+    ("FCBayern",   "BVB"),          # Der Klassiker
+]
+
+# ── Event detection engine ────────────────────────────────────────────────────
+# Order matters: trophy > goal > loss > conceded > win > generic
+# NOTE: \b word boundaries don't work with Arabic script; Arabic patterns use plain search.
+_EVENT_PATTERNS: dict[str, list[str]] = {
+    "trophy":   [r"\bchampion(s)?\b", r"\btitle\b", r"\btrophy\b", r"\bcup\b", r"🏆",
+                 "بطل", "لقب", "بطولة", "كأس"],
+    "goal":     [r"\bgoal\b", r"\bscores?\b", r"\bGOAL\b", r"\bgolazo\b", r"⚽",
+                 "يسجل", "هدف", "أهداف"],
+    "loss":     [r"\blos(e|t|ing)\b", r"\bdefeat(ed)?\b",
+                 "يخسر", "خسارة", "هزيمة", "انهيار"],
+    "conceded": [r"\bconcede(d|s)?\b", r"\bgave away\b",
+                 "يستقبل", "يتلقى"],
+    "win":      [r"\bwin(s|ning)?\b", r"\bwon\b", r"\bvictory\b", r"\b3 points\b",
+                 "يفوز", "فوز", "انتصار"],
+}
+
+
+def detect_event(text: str) -> str:
+    """Return the dominant football event in tweet text, or 'generic'."""
+    for event, patterns in _EVENT_PATTERNS.items():
+        for pat in patterns:
+            if re.search(pat, text, re.IGNORECASE):
+                return event
+    return "generic"
+
+
+def detect_derby(username: str, tweet_text: str) -> bool:
+    """Return True when the tweet references a known rival of `username`."""
+    for pair in RIVALRY_PAIRS:
+        if username in pair:
+            rival = pair[1] if pair[0] == username else pair[0]
+            rival_profile = CLUB_PROFILES.get(rival, {})
+            rival_name    = rival_profile.get("name", rival)
+            if rival.lower() in tweet_text.lower() or rival_name.lower() in tweet_text.lower():
+                return True
+    return False
+
+
 # ── Env validation ────────────────────────────────────────────────────────────
 
 def validate_env() -> None:
@@ -249,41 +367,170 @@ _STYLE_SEEDS: list[str] = [
     "server down", "patch update", "debug mode", "laggy VAR",
     "cpu overload", "latency issue", "infinite loop", "merge conflict",
     "rate limited", "buffer overflow", "garbage collected",
+    "deployment failed", "firewall breach", "kernel panic",
 ]
 
-_SYSTEM_PROMPT = """\
-You are @BugKSA: a Saudi football sarcasm bot with light tech humor.
+# ── Dynamic system-prompt builder ─────────────────────────────────────────────
 
-Rules:
-- Style ratio: 80% football banter, 20% tech joke
-- Output: exactly ONE line, ≤260 characters
-- Language: detect the language of the input tweet; reply in the SAME language \
-(Arabic → Arabic, English → English, Spanish → Spanish, etc.)
-- Always end with a tiny football or tech observation (one short clause)
-- Use the given style seed to vary your punchline each time; do not repeat
-- FORBIDDEN: politics, religion, hate, harassment, doxxing, personal attacks
-- Joke about teams/situations only – never about individuals personally
-- If the source tweet is sensitive or ambiguous, give a safe evasive football joke
+def _build_system_prompt(
+    username: str,
+    event: str,
+    is_derby: bool,
+    lang: str,
+) -> str:
+    """Build a contextual system prompt tailored to club, event, and language."""
+    profile      = CLUB_PROFILES.get(username, {})
+    club_name    = profile.get("name", username)
+    personality  = profile.get("personality", "a regular club")
+
+    # Language rule
+    if lang == "ar-sa":
+        lang_rule = (
+            "الرد يجب أن يكون باللهجة العربية السعودية فقط. "
+            "مسموح فقط بالمصطلحات التقنية بالإنجليزي (Bug, Lag, 404…). "
+            "ممنوع منعاً باتاً الردود الإنجليزية الكاملة."
+        )
+    else:
+        lang_rule = (
+            "Reply ONLY in English. "
+            "Do NOT switch to Arabic. "
+            "Tech terms may be English (Bug, Lag, 404…)."
+        )
+
+    # Event-mode instruction
+    event_instructions: dict[str, str] = {
+        "goal":     "⚽ EVENT: Goal scored – fast sarcastic celebration or mock surprise",
+        "win":      "🏅 EVENT: Win – celebratory sarcasm or mock the defeated rival's weakness",
+        "loss":     ("💥 EVENT — MELTDOWN MODE: heavy loss detected.\n"
+                     "Use dramatic failure metaphors: server crash · 404 defense · "
+                     "system collapse · critical bug · memory leak · kernel panic"),
+        "trophy":   ("🏆 EVENT — TROPHY MODE: championship won.\n"
+                     "Mock absent rivals. Legacy sarcasm. "
+                     "Treat history like open-source code nobody else can run."),
+        "conceded": "🚨 EVENT: Goal conceded – defensive failure sarcasm, VAR jokes",
+        "generic":  "⚽ General football moment – sharp sarcastic tech commentary",
+    }
+    event_block = event_instructions.get(event, event_instructions["generic"])
+
+    # Derby boost
+    derby_block = ""
+    if is_derby:
+        derby_block = (
+            "\n🔥 DERBY MODE ACTIVE: this is a rivalry match. "
+            "Amplify sarcasm ×1.5 – maximum banter, still safe and clean."
+        )
+
+    return f"""\
+You are @BugKSA – a legendary autonomous football banter AI.
+Ratio: 80 % football banter + 20 % tech metaphors.
+Tone: sharp, witty, mocking, playful. NEVER abusive or hateful.
+
+🎭 Club personality for this reply:
+  {club_name} → {personality}
+
+🌍 Language rule (STRICT – breaking this = invalid reply):
+  {lang_rule}
+
+{event_block}{derby_block}
+
+⚙️ Golden rules:
+- Output exactly ONE line, ≤260 characters
+- Use the provided style seed to vary the punchline
+- Allowed tech vocabulary: Lag · Timeout · Bug · 404 · Patch · Deployment failed ·
+  Memory leak · Server crash · Firewall breach · Cache clear · Kernel panic · Null pointer
+- FORBIDDEN: politics · religion · hate · harassment · doxxing · personal attacks
+- Mock teams and situations ONLY – never individuals personally
+- If the tweet is sensitive or ambiguous → give a safe evasive football joke
+
+✅ Self-check before outputting (regenerate if any check fails):
+  1. Language matches the rule above
+  2. Club personality ({club_name}) is reflected
+  3. Event mode ({event}) is applied
+  4. Sarcasm is present
+  5. At least one tech metaphor/keyword is present
+  6. Content is safe and clean
 """
 
 
-def generate_reply(ai: OpenAI, tweet_text: str, style_seed: str) -> str:
+# ── Generation quality validator ──────────────────────────────────────────────
+
+_TECH_KEYWORDS = {
+    "lag", "timeout", "bug", "404", "patch", "server", "crash", "firewall",
+    "cache", "deployment", "memory", "leak", "loop", "null", "error", "stack",
+    "overflow", "hotfix", "debug", "kernel", "panic", "cpu", "buffer", "ping",
+    "سيرفر", "لاق", "باق",
+}
+
+
+def _validate_reply(reply: str, lang: str, event: str) -> tuple[bool, str]:
+    """Basic generation quality check. Returns (passed, fail_reason)."""
+    if len(reply) < 15:
+        return False, "reply too short"
+
+    lower = reply.lower()
+
+    # Must contain at least one tech keyword
+    if not any(kw in lower for kw in _TECH_KEYWORDS):
+        return False, "no tech metaphor"
+
+    # Meltdown / trophy mode: prefer dramatic language (soft check only – log warning)
+    if event == "loss":
+        heavy_terms = {"crash", "404", "collapse", "leak", "panic", "null", "bug"}
+        if not any(t in lower for t in heavy_terms):
+            log.debug("Meltdown mode: soft check – missing heavy failure term")
+
+    # Hard forbidden content check
+    forbidden = {"hate", "terrorist", "bomb", "kill", "attack"}
+    if any(w in lower for w in forbidden):
+        return False, "forbidden content detected"
+
+    return True, ""
+
+
+# ── AI reply generation ───────────────────────────────────────────────────────
+
+def generate_reply(
+    ai: OpenAI,
+    tweet_text: str,
+    style_seed: str,
+    *,
+    username: str = "",
+    event: str = "generic",
+    is_derby: bool = False,
+    lang: str = "en",
+) -> str:
+    """Generate a contextual sarcastic reply with up to 3 self-validation retries."""
+    system   = _build_system_prompt(username, event, is_derby, lang)
     user_msg = f"Style seed: '{style_seed}'\n\nTweet:\n{tweet_text}"
-    try:
-        resp = ai.chat.completions.create(
-            model=OPENAI_MODEL,
-            messages=[
-                {"role": "system", "content": _SYSTEM_PROMPT},
-                {"role": "user",   "content": user_msg},
-            ],
-            temperature=0.92,
-            max_completion_tokens=90,
-        )
-        text = resp.choices[0].message.content.strip()
-        return " ".join(text.splitlines()).strip()[:260]
-    except Exception as e:
-        log.warning(f"OpenAI generate_reply error: {e}")
-        return "VAR under review… system timeout. ⚽🤖"
+
+    for attempt in range(3):
+        try:
+            resp = ai.chat.completions.create(
+                model=OPENAI_MODEL,
+                messages=[
+                    {"role": "system", "content": system},
+                    {"role": "user",   "content": user_msg},
+                ],
+                temperature=min(0.92 + attempt * 0.05, 1.1),
+                max_completion_tokens=100,
+            )
+            text  = resp.choices[0].message.content.strip()
+            reply = " ".join(text.splitlines()).strip()[:260]
+
+            ok, reason = _validate_reply(reply, lang, event)
+            if ok:
+                if attempt > 0:
+                    log.info(f"Generation check: passed on attempt {attempt + 1}")
+                return reply
+
+            log.info(f"Generation check fail (attempt {attempt + 1}/{3}): {reason} → retrying")
+        except Exception as e:
+            log.warning(f"OpenAI generate_reply error (attempt {attempt + 1}): {e}")
+
+    # Fallback – guaranteed to be safe
+    if lang == "ar-sa":
+        return "VAR راجع الحركة… السيرفر وقف. ⚽🤖"
+    return "VAR stuck in an infinite loop – system timeout. ⚽🤖"
 
 
 def generate_recovery_tweet(ai: OpenAI) -> str:
@@ -459,9 +706,13 @@ def run_mentions_mode(
         if not can_act(state):
             return False
 
-        seed = random.choice(_STYLE_SEEDS)
-        reply = generate_reply(ai, item.text, seed)
-        log.info(f"Mention {tid}: replying (seed={seed!r})")
+        seed  = random.choice(_STYLE_SEEDS)
+        event = detect_event(item.text)
+        reply = generate_reply(
+            ai, item.text, seed,
+            event=event, lang="ar-sa",  # mentions default to Saudi Arabic
+        )
+        log.info(f"Mention {tid}: replying (seed={seed!r}, event={event})")
         if post_reply(client, reply, tid, state):
             replied_set.add(tid)
             state["replied_tweet_ids"] = list(replied_set)
@@ -531,9 +782,21 @@ def run_sniping_mode(
             if not can_act(state):
                 return False
 
-            seed = random.choice(_STYLE_SEEDS)
-            reply = generate_reply(ai, tweet.text, seed)
-            log.info(f"Snipe @{username} {tid}: replying (seed={seed!r})")
+            seed      = random.choice(_STYLE_SEEDS)
+            event     = detect_event(tweet.text)
+            is_derby  = detect_derby(username, tweet.text)
+            lang      = CLUB_PROFILES.get(username, {}).get("lang", "en")
+            reply = generate_reply(
+                ai, tweet.text, seed,
+                username=username,
+                event=event,
+                is_derby=is_derby,
+                lang=lang,
+            )
+            log.info(
+                f"Snipe @{username} {tid}: replying "
+                f"(event={event}, derby={is_derby}, lang={lang}, seed={seed!r})"
+            )
             if post_reply(client, reply, tid, state):
                 replied_set.add(tid)
                 state["replied_tweet_ids"] = list(replied_set)
