@@ -583,11 +583,13 @@ def run_recovery_mode(client: tweepy.Client, ai: OpenAI, state: dict) -> bool:
 # ── Persistent storage probe ──────────────────────────────────────────────────
 
 def probe_data_dir() -> None:
-    """Verify the data directory is writable before the bot starts.
+    """Verify the data directory is writable, then seed missing data files.
 
-    Writes and removes a sentinel file.  Fails fast with a clear error if the
-    Railway Volume is not mounted — better than silently writing to an
-    ephemeral container layer that disappears on every redeploy.
+    1. Writes and removes a sentinel file to confirm write access.
+       Fails fast (sys.exit) if the Railway Volume is not mounted so the
+       bot never silently writes to an ephemeral container layer.
+    2. Creates state.json and pending.json with empty defaults on first run
+       so their presence on the Volume is immediately visible after deploy.
     """
     data_dir = STATE_FILE_PATH.parent
     sentinel = data_dir / ".write_probe"
@@ -595,16 +597,38 @@ def probe_data_dir() -> None:
         data_dir.mkdir(parents=True, exist_ok=True)
         sentinel.write_text("ok")
         sentinel.unlink()
-        log.info(f"  Storage probe : {data_dir} is writable ✓")
     except OSError as exc:
         log.error(
-            f"  Storage probe FAILED: cannot write to {data_dir}\n"
+            f"Storage probe FAILED: cannot write to {data_dir}\n"
             f"  {exc}\n"
             f"  → Create a Railway Volume named 'bot_data' and mount it at /app/data\n"
             f"    CLI: railway volume create bot_data\n"
             f"         railway volume mount bot_data --service <id> --mount-path /app/data"
         )
         sys.exit(1)
+
+    log.info(f"Storage probe: {data_dir} is writable")
+
+    # ── First-run file initialisation ────────────────────────────────────────
+    if not STATE_FILE_PATH.exists():
+        default_state: dict = {
+            "last_mention_id":     None,
+            "last_seen_by_target": {},
+            "replied_tweet_ids":   [],
+            "actions_log":         [],
+            "target_last_acted":   {},
+            "recovery_tweets_log": [],
+        }
+        STATE_FILE_PATH.write_text(
+            json.dumps(default_state, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+        log.info(f"  Created {STATE_FILE_PATH} (first run)")
+
+    if not PENDING_FILE_PATH.exists():
+        PENDING_FILE_PATH.parent.mkdir(parents=True, exist_ok=True)
+        PENDING_FILE_PATH.write_text("[]", encoding="utf-8")
+        log.info(f"  Created {PENDING_FILE_PATH} (first run)")
 
 
 # ── Entry point ───────────────────────────────────────────────────────────────
