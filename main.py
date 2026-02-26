@@ -72,9 +72,9 @@ DRY_RUN           = _flag("DRY_RUN",         default=False)
 RECOVERY_MODE     = _flag("RECOVERY_MODE",   default=True)
 
 # ── Rate-limit constants ──────────────────────────────────────────────────────
-RATE_MIN_GAP  = 600   # ≥10 minutes between any two actions
-RATE_MAX_HOUR = 6     # rolling 60-minute cap
-RATE_MAX_DAY  = 25    # rolling 24-hour cap
+RATE_MIN_GAP  = 45    # ≥45 seconds between any two actions
+RATE_MAX_HOUR = 10    # rolling 60-minute cap (≤10–12/hr per spec)
+RATE_MAX_DAY  = 100   # rolling 24-hour cap
 
 # Recovery-mode constants (posted-flagged-account rehabilitation)
 RECOVERY_MAX_DAY = 3     # original status tweets per day
@@ -82,8 +82,19 @@ RECOVERY_MIN_GAP = 7200  # ≥2 hours between recovery tweets
 
 # ── Target club accounts ──────────────────────────────────────────────────────
 TARGET_USERNAMES: list[str] = [
-    "Alhilal_FC", "ALAHLI_FC", "ittihad", "AlNassrFC",
+    # Saudi Pro League
+    "Alhilal_FC", "AlNassrFC", "ittihad", "ALAHLI_FC",
+    "AlQadsiah", "AlShabab_FC", "AlFaisaly_FC", "AlTaawon_FC",
+    "AlFatehFC", "AlRaedFC",
+    # Saudi sports media / figures
+    "Hadaf_SA", "kooora",
+    # English Premier League
+    "ManUtd", "Arsenal", "ChelseaFC", "SpursOfficial",
+    "LCFC", "Everton", "WestHam", "Wolves",
+    # Champions League heavy-weights
     "realmadrid", "FCBarcelona", "ManCity", "LFC",
+    "juventusfc", "PSG_inside", "FCBayern", "BVB",
+    "Atleti",
 ]
 
 # ── Env validation ────────────────────────────────────────────────────────────
@@ -181,9 +192,9 @@ def can_act(state: dict) -> bool:
     """Return True only when ALL three rate-limit constraints are satisfied.
 
     Constraints:
-      1. now - actions_log[-1] >= RATE_MIN_GAP  (≥10 min gap)
-      2. count(actions in last 3600s) < RATE_MAX_HOUR  (6/hr)
-      3. count(actions in last 86400s) < RATE_MAX_DAY  (25/day)
+      1. now - actions_log[-1] >= RATE_MIN_GAP  (≥45 s gap)
+      2. count(actions in last 3600s) < RATE_MAX_HOUR  (10/hr)
+      3. count(actions in last 86400s) < RATE_MAX_DAY  (100/day)
     """
     now = time.time()
     log_ts: list[float] = [t for t in state.get("actions_log", []) if now - t < 86400]
@@ -477,10 +488,10 @@ def run_sniping_mode(
     random.shuffle(targets)  # avoid always hitting the same account first
 
     for username, uid in targets:
-        # Per-target 24-hour cooldown
+        # Per-target 4-hour cooldown (allows broader coverage across all clubs)
         last_acted = state.get("target_last_acted", {}).get(username, 0.0)
-        if now - last_acted < 86400:
-            remaining_h = (86400 - (now - last_acted)) / 3600
+        if now - last_acted < 14400:
+            remaining_h = (14400 - (now - last_acted)) / 3600
             log.info(f"Snipe @{username}: cooldown {remaining_h:.1f}h remaining – skip")
             continue
 
@@ -690,7 +701,7 @@ def main() -> None:
 
         save_state(state)
 
-        sleep_s = random.randint(120, 300)  # 2–5 minutes
+        sleep_s = random.randint(45, 90)  # 45–90 seconds per spec
         log.info(f"Sleeping {sleep_s}s …")
         time.sleep(sleep_s)
 
