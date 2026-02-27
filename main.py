@@ -49,6 +49,9 @@ X_ACCESS_SECRET = env("X_ACCESS_SECRET")
 
 DRY_RUN       = (os.getenv("DRY_RUN")       or "false").strip().lower() in ("1", "true", "yes")
 RECOVERY_MODE = (os.getenv("RECOVERY_MODE") or "false").strip().lower() in ("1", "true", "yes")
+# Feature flag: club timeline polling (GET /2/users/:id/tweets).
+# Requires Basic/Pro X API tier.  Default=false (free tier safe).
+CLUB_SNIPING  = (os.getenv("CLUB_SNIPING")  or "false").strip().lower() in ("1", "true", "yes")
 
 STATE_FILE = Path((os.getenv("STATE_FILE_PATH") or "/app/data/state.json").strip())
 STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
@@ -807,7 +810,7 @@ def monitor_mentions_and_snipes() -> None:
     my_id = me.data.id
 
     log.info("=" * 60)
-    log.info(f"BugKSA online  my_id={my_id}  DRY_RUN={DRY_RUN}  RECOVERY_MODE={RECOVERY_MODE}  GEN_ENGINE={GEN_ENGINE}")
+    log.info(f"BugKSA online  my_id={my_id}  DRY_RUN={DRY_RUN}  RECOVERY_MODE={RECOVERY_MODE}  GEN_ENGINE={GEN_ENGINE}  CLUB_SNIPING={CLUB_SNIPING}")
     log.info(
         f"Governor: gap≥{MIN_GAP_SECONDS // 60}min | burst≤{DERBY_BURST_MAX_30MIN}/30min | "
         f"{MAX_PER_HOUR}/hr | {MAX_PER_DAY}/day | humanize_skip={int(HUMANIZE_SKIP_RATE * 100)}%"
@@ -882,72 +885,78 @@ def monitor_mentions_and_snipes() -> None:
                     did_action = True
 
             # ── 2. Club radar (sniping) ───────────────────────────────────────
-            for uname, meta in targets.items():
-                uid = meta.get("id")
-                if not uid:
-                    continue
-
-                last_seen = state["last_seen_by_user"].get(uid)
-                tweets = x.get_users_tweets(
-                    id=uid,
-                    since_id=last_seen,
-                    max_results=5,
-                    user_auth=True,
-                )
-                if not tweets or not tweets.data:
-                    continue
-
-                if tweets.meta and tweets.meta.get("newest_id"):
-                    state["last_seen_by_user"][uid] = tweets.meta["newest_id"]
-
-                for tw in tweets.data:
-                    tid = str(tw.id)
-                    if tid in replied_set:
-                        continue
-                    if tw.text.strip().startswith("RT"):
-                        continue
-                    if tw.text.count("http") >= 2:
-                        replied_set.add(tid)
-                        state["replied_tweet_ids"].append(tid)
-                        save_state(state)
+            # Disabled by default: CLUB_SNIPING=false (free-tier safe).
+            # GET /2/users/:id/tweets requires Basic/Pro X API plan.
+            # Set env var CLUB_SNIPING=true only after confirming your plan allows it.
+            if not CLUB_SNIPING:
+                log.debug("Club sniping disabled (CLUB_SNIPING=false) – skipping timeline polling")
+            else:
+                for uname, meta in targets.items():
+                    uid = meta.get("id")
+                    if not uid:
                         continue
 
-                    # Humanize: clubs skip 40 %, personality accounts skip 70 %
-                    skip_rate = PERSONALITY_SKIP_RATE if meta.get("origin") == "personality" else HUMANIZE_SKIP_RATE
-                    if random.random() < skip_rate:
-                        log.info(f"Snipe @{uname} {tid}: humanized skip")
+                    last_seen = state["last_seen_by_user"].get(uid)
+                    tweets = x.get_users_tweets(
+                        id=uid,
+                        since_id=last_seen,
+                        max_results=5,
+                        user_auth=True,
+                    )
+                    if not tweets or not tweets.data:
                         continue
 
-                    derby = is_derby(tw.text)
-                    ok, reason = governor_allows(state, derby=derby)
-                    if not ok:
-                        log.info(f"Snipe @{uname}: governor – {reason}")
-                        break
+                    if tweets.meta and tweets.meta.get("newest_id"):
+                        state["last_seen_by_user"][uid] = tweets.meta["newest_id"]
 
-                    lang_hint = "ar" if detect_arabic(tw.text) else "en"
-                    reply = ""
-                    for attempt in range(3):
-                        cand = generate_reply(tw.text, lang_hint=lang_hint, state=state)
-                        if quality_ok(cand, lang_hint):
-                            reply = cand
+                    for tw in tweets.data:
+                        tid = str(tw.id)
+                        if tid in replied_set:
+                            continue
+                        if tw.text.strip().startswith("RT"):
+                            continue
+                        if tw.text.count("http") >= 2:
+                            replied_set.add(tid)
+                            state["replied_tweet_ids"].append(tid)
+                            save_state(state)
+                            continue
+
+                        # Humanize: clubs skip 40 %, personality accounts skip 70 %
+                        skip_rate = PERSONALITY_SKIP_RATE if meta.get("origin") == "personality" else HUMANIZE_SKIP_RATE
+                        if random.random() < skip_rate:
+                            log.info(f"Snipe @{uname} {tid}: humanized skip")
+                            continue
+
+                        derby = is_derby(tw.text)
+                        ok, reason = governor_allows(state, derby=derby)
+                        if not ok:
+                            log.info(f"Snipe @{uname}: governor – {reason}")
                             break
-                        log.info(f"Snipe @{uname} quality_ok fail attempt {attempt + 1} → retrying")
 
-                    if not reply:
-                        log.info(f"Snipe @{uname}: no quality reply – skip")
+                        lang_hint = "ar" if detect_arabic(tw.text) else "en"
+                        reply = ""
+                        for attempt in range(3):
+                            cand = generate_reply(tw.text, lang_hint=lang_hint, state=state)
+                            if quality_ok(cand, lang_hint):
+                                reply = cand
+                                break
+                            log.info(f"Snipe @{uname} quality_ok fail attempt {attempt + 1} → retrying")
+
+                        if not reply:
+                            log.info(f"Snipe @{uname}: no quality reply – skip")
+                            replied_set.add(tid)
+                            state["replied_tweet_ids"].append(tid)
+                            save_state(state)
+                            continue
+
+                        log.info(f"Snipe @{uname}: replying → {reply}")
+                        post_reply(state, tw.id, reply, lang_hint)
                         replied_set.add(tid)
                         state["replied_tweet_ids"].append(tid)
+                        if derby:
+                            state["derby_burst_log"].append(now_ts())
                         save_state(state)
-                        continue
-
-                    log.info(f"Snipe @{uname}: replying → {reply}")
-                    post_reply(state, tw.id, reply, lang_hint)
-                    replied_set.add(tid)
-                    state["replied_tweet_ids"].append(tid)
-                    if derby:
-                        state["derby_burst_log"].append(now_ts())
-                    save_state(state)
-                    did_action = True
+                        did_action = True
 
         except Exception as e:
             # 402 = credits exhausted – sleep 1 h, don't hammer the API

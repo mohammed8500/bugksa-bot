@@ -6,13 +6,14 @@
 #   railway volume mount bot_data --service <worker-service-id> --mount-path /app/data
 #
 # Required env vars to set in Railway dashboard:
-#   OPENAI_API_KEY, X_API_KEY, X_API_SECRET, X_ACCESS_TOKEN, X_ACCESS_SECRET
+#   GEMINI_API_KEY, X_API_KEY, X_API_SECRET, X_ACCESS_TOKEN, X_ACCESS_SECRET
 #
 # Optional env vars (defaults already coded in main.py):
 #   STATE_FILE_PATH   = /app/data/state.json
 #   PENDING_FILE_PATH = /app/data/pending.json
 #   DRY_RUN           = false   # default; set to "true" to revert to draft-only mode
-#   RECOVERY_MODE     = true
+#   RECOVERY_MODE     = false
+#   CLUB_SNIPING      = false   # keep false unless X API plan is Basic/Pro (avoids 402)
 
 [deploy]
 startCommand    = "python main.py"
