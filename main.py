@@ -6,7 +6,7 @@ Saudi football banter.  Every post goes through a 3-layer safety stack:
 
   Layer 1 – Anti-spam governor  (HARD limits, never overridden)
   Layer 2 – Identity gate        (quality_ok() blocks generic/journalist output)
-  Layer 3 – OpenAI constitution  (SYSTEM_CONSTITUTION enforces 3-part structure)
+  Layer 3 – Gemini constitution  (GEMINI_CONSTITUTION enforces 3-part structure)
 """
 
 import os
@@ -18,7 +18,7 @@ import logging
 from pathlib import Path
 
 import tweepy
-from openai import OpenAI
+import google.generativeai as genai
 
 # ── Logging ───────────────────────────────────────────────────────────────────
 
@@ -39,8 +39,8 @@ def env(name: str, required: bool = True) -> str:
     return v
 
 
-OPENAI_API_KEY  = env("OPENAI_API_KEY")
-OPENAI_MODEL    = (os.getenv("OPENAI_MODEL") or "gpt-4o-mini").strip()
+GEN_ENGINE = "gemini"
+
 X_API_KEY       = env("X_API_KEY")
 X_API_SECRET    = env("X_API_SECRET")
 X_ACCESS_TOKEN  = env("X_ACCESS_TOKEN")
@@ -132,16 +132,30 @@ RIVAL_PAIRS: list[tuple[str, str]] = [
 
 # Generic / journalist phrases → auto-reject
 _GENERIC_PHRASES: list[str] = [
-    # English
+    # English – original
     "stats are crazy", "this season", "great match", "good result",
     "well played", "played well", "impressive performance", "both teams",
     "exciting game", "strong performance", "tough match", "quality football",
     "incredible match", "wow what a", "what a game", "great game",
     "dominated the", "very competitive", "amazing display",
-    # Arabic
+    # English – new cold/journalist phrases
+    "very impressive", "what a performance", "top quality",
+    "played brilliantly", "superb display", "clinical finishing",
+    "outstanding result", "absolutely incredible", "well deserved",
+    "great effort", "solid game", "nice result", "looking good",
+    "credit to both", "credit where it", "has to be said",
+    "gotta say", "not gonna lie", "ngl,", "honestly though",
+    "fair play to", "respect to",
+    # Arabic – original
     "إحصائيات رائعة", "أداء رائع", "كلا الفريقين", "مباراة ممتازة",
     "نتيجة جيدة", "أداء قوي", "لعبوا جيدًا", "لعبوا بشكل",
     "مباراة مثيرة", "مباراة رائعة",
+    # Arabic – new cold/journalist phrases
+    "مباراة حماسية", "تفوق واضح", "نتيجة متوقعة",
+    "أداء متميز", "مستوى عالٍ", "فريق قوي",
+    "انتصار مستحق", "أداء استثنائي", "مباراة قوية",
+    "الفريق بذل جهداً", "بالتوفيق للفريقين",
+    "ما شاء الله", "الله يوفقهم", "شاطرين", "عاشوا",
 ]
 
 # Tech keywords – at least one must appear (PART 2 of the 3-part structure)
@@ -271,6 +285,19 @@ def has_sarcasm_marker(text: str) -> bool:
 has_banter_energy = has_sarcasm_marker
 
 
+def _extract_tech_metaphor(text: str) -> str | None:
+    """Return the first tech keyword found in text (used for anti-repeat tracking).
+
+    Iterates _TECH_WORDS in sorted order for determinism.
+    Returns None if no tech word is present (reply will skip anti-repeat gate).
+    """
+    t = text.lower()
+    for w in sorted(_TECH_WORDS):
+        if w in t:
+            return w
+    return None
+
+
 def has_english_banter_token(text: str) -> bool:
     """English-specific check: reply must contain ≥1 club mock token.
 
@@ -355,6 +382,7 @@ def load_state() -> dict:
     s.setdefault("last_action_ts",    0)
     s.setdefault("derby_burst_log",   [])   # timestamps in last 30 min
     s.setdefault("next_action_after", 0.0)  # humanized gate: earliest allowed next post
+    s.setdefault("recent_metaphors",  [])   # anti-repeat: last 20 tech keywords used
 
     # ── One-time migration: drop legacy recovery_tweets_log (old cap=3 system) ──
     stale = s.pop("recovery_tweets_log", None)
@@ -379,6 +407,7 @@ def save_state(state: dict) -> None:
     state["actions_log"]      = [t for t in state.get("actions_log",      []) if t >= cutoff_24h]
     cutoff_30m = now_ts() - 1800
     state["derby_burst_log"]  = [t for t in state.get("derby_burst_log",  []) if t >= cutoff_30m]
+    state["recent_metaphors"] = state.get("recent_metaphors", [])[-20:]  # keep last 20
     tmp = STATE_FILE.with_suffix(".tmp")
     with tmp.open("w", encoding="utf-8") as f:
         json.dump(state, f, ensure_ascii=False, indent=2)
@@ -443,35 +472,41 @@ def governor_allows(state: dict, derby: bool = False) -> tuple[bool, str]:
     return True, "ok"
 
 
-# ── OpenAI client ─────────────────────────────────────────────────────────────
+# ── AI client – lazy-initialised on first generate call ──────────────────────
 
-ai = OpenAI(api_key=OPENAI_API_KEY)
+_gemini_client: "genai.GenerativeModel | None" = None
 
-# ── SYSTEM CONSTITUTION (BugKSA identity – non-negotiable) ───────────────────
+log.info("Engine: GEMINI (lazy init)")
 
-SYSTEM_CONSTITUTION = """\
-You are @BugKSA – a Saudi football banter account. NOT a sports journalist. NOT a news bot.
+# ── Fallback reply (used when LLM API fails completely) ───────────────────────
+# Passes quality_ok() for both "ar" and "en": tech(سيرفر) + sarcasm(😂 !) = 2/3
+FALLBACK_REPLY = "السيرفر يهنق والمباراة ما وقفت! 😂 هذا الدوري مو رحيم"
 
-═══ IDENTITY (NON-NEGOTIABLE) ═══
-• Ratio: 80 % Saudi football sarcasm/طقطقة + 20 % tech metaphors
-• Tone: short · punchy · meme-like cadence – NEVER journalist-style or neutral analysis
-• Safe sarcasm ONLY: no hate, harassment, slurs, doxxing, sexual content, politics, religion
+# ── GEMINI CONSTITUTION (BugKSA identity – non-negotiable) ───────────────────
 
-═══ LANGUAGE RULE ═══
-• Reply in the SAME language as the target tweet
-• Arabic tweet → Saudi Arabic reply  (tech terms in English are OK: Bug, Lag, 404)
-• English tweet → English reply ONLY
-• NEVER mix languages in one reply
+GEMINI_CONSTITUTION = """\
+أنت @BugKSA – حساب طقطقة كروية سعودية. لست صحفياً رياضياً. لست بوت أخبار.
 
-═══ MANDATORY 3-PART STRUCTURE (all three required in every reply) ═══
-  PART 1 → TARGET/JAB    – aim the banter at the club, match, or situation
-  PART 2 → TECH METAPHOR – weave in ONE tech keyword naturally
-  PART 3 → PUNCHLINE     – land the joke: unexpected, sharp, meme-like ending
+═══ الهوية (غير قابلة للتغيير) ═══
+• النسبة: 90% طقطقة شعبية سعودية حارة + 10% مصطلحات تقنية
+• الأسلوب: قصير · ضربة واحدة · طاقة ميم – لا تحليل صحفي أبداً
+• محتوى آمن فقط: لا كراهية، لا تحرش، لا سياسة، لا دين
 
-  Example (Arabic):  "الدفاع crash كامل، والـ VAR بعد شايل null pointer 🤦‍♂️"
-  Example (English): "That defending just triggered a full server meltdown – 404 tactics not found 💀"
+═══ قاعدة اللغة ═══
+• رد بنفس لغة التغريدة المستهدفة
+• تغريدة عربية → رد بالسعودي العامي (المصطلحات التقنية بالإنجليزي مقبولة: Bug، Lag، 404)
+• تغريدة إنجليزية → رد إنجليزي فقط
+• لا تخلط اللغتين أبداً
 
-═══ ENGLISH BANTER TOKENS – use ≥1 per English reply ═══
+═══ الهيكل الإلزامي 3 أجزاء (الثلاثة مطلوبة في كل رد) ═══
+  PART 1 → الطعنة/الهجوم    – وجّه الطقطقة على النادي أو الموقف
+  PART 2 → الاستعارة التقنية – ادرج مصطلح تقني واحد بشكل طبيعي
+  PART 3 → القفلة            – اقفل النكتة: غير متوقعة، حادة، نهاية مثل الميم
+
+  مثال (عربي):    "الدفاع crash كامل، والـ VAR بعد شايل null pointer 🤦‍♂️"
+  مثال (إنجليزي): "That defending just triggered a full server meltdown – 404 tactics not found 💀"
+
+═══ ENGLISH BANTER TOKENS – استخدم ≥1 في كل رد إنجليزي ═══
   Man Utd     → "museum FC"  · "404 trophies"  · "nostalgia build"
   Chelsea     → "billion-dollar beta"  · "chaos patch"  · "no stable release"
   Arsenal     → "almost FC"  · "beta champions"  · "April crash"
@@ -481,59 +516,64 @@ You are @BugKSA – a Saudi football banter account. NOT a sports journalist. NO
   Barcelona   → "economic levers"  · "debt mode"  · "ghost payroll"
   Real Madrid → "UCL script"  · "plot armor"  · "final boss mode"
 
-  Accept examples:
-    "Arsenal running April_crash.exe again 💀"
-    "Chelsea still in billion-dollar beta – no stable release detected 😂"
-    "United nostalgia build loading… 404 trophies not found 🤦"
+═══ ممنوع كلياً – إذا ظهر أي منها أعد التوليد فوراً ═══
+  ✗ "ما شاء الله"  ·  "الله يوفقهم"  ·  "بالتوفيق"  ·  "عاشوا"  ·  "شاطرين"
+  ✗ "مباراة ممتعة"  ·  "مباراة رائعة"  ·  "مستوى عالٍ"  ·  "أداء متميز"
+  ✗ "great match"  ·  "well played"  ·  "impressive performance"  ·  "both teams"
+  ✗ أي جملة يمكن لصحفي رياضي أن يكتبها بدون خجل
+  ✗ أكثر من جملة واحدة (سطر واحد حاد فقط)
+  ✗ هاشتاقات (#) أو إشارات (@)
 
-═══ BANNED OUTPUT – regenerate immediately if any of these appear ═══
-  ✗ "great performance tonight"  ·  "stats are impressive"  ·  "team is dominating"
-  ✗ "Stats are crazy this season" or any neutral stats observation
-  ✗ "Impressive performance tonight" or any generic praise
-  ✗ "Both teams played well" – neutral = auto-rejected
-  ✗ Any sentence a sports journalist could write without embarrassment
-  ✗ More than ONE sentence (one punchy line only)
-  ✗ Hashtags (#) or @mentions
-
-═══ ALLOWED TECH VOCABULARY ═══
+═══ المفردات التقنية المسموح بها ═══
   Lag · Timeout · Bug · 404 · Patch · Deployment failed · Memory leak ·
   Server crash · Firewall breach · Cache clear · Kernel panic · Null pointer ·
   CPU overload · Rollback · Hotfix · Debug mode · Ping spike ·
   سيرفر · لاق · باق · تايم أوت · كاش
 
-═══ SELF-CHECK before outputting (regenerate if ANY fails) ═══
-  1. Language matches the target tweet
-  2. PART 1 (target/jab) is present
-  3. PART 2 (tech metaphor keyword) is present
-  4. PART 3 (punchline/meme ending) lands the joke
-  5. For English replies: ≥1 club banter token is present (see ENGLISH BANTER TOKENS above)
-  6. ZERO journalist phrasing or neutral analysis
-  7. Content is safe and clean
-  8. Single punchy line ≤240 characters
+═══ تحقق ذاتي قبل الإرسال (أعد التوليد إذا فشل أي منها) ═══
+  1. اللغة تطابق التغريدة المستهدفة
+  2. PART 1 (الطعنة) موجودة
+  3. PART 2 (المصطلح التقني) موجودة
+  4. PART 3 (القفلة) حادة ومفاجئة
+  5. للردود الإنجليزية: ≥1 banter token من القائمة أعلاه
+  6. صفر صياغة صحفية أو تحليل محايد
+  7. المحتوى آمن ونظيف
+  8. سطر واحد حاد ≤240 حرف
 """
 
 # Style seeds drive creative variety
 _STYLE_SEEDS_AR: list[str] = [
+    # ── original seeds ──
     "طقطقة خفيفة مع قفلة سعودية",
     "مقلب تقني على الدفاع",
     "سخرية كروية سريعة",
     "ذبة قصيرة وتمون",
     "نفس مشجع فاصل بعد مباراة",
+    # ── guided improvisation: Saudi daily-life metaphors ──
+    "تشبيه الدفاع بشبكة اتصال واقفة في حفل",
+    "مقارنة الهجوم بطابور دوائر حكومية بعد الظهر",
+    "ذبة بروح جلسة قهوة سعودية بعد المباراة",
+    "تشبيه التكتيك بطلبية أوبر ما وصلت وما ألغت",
+    "سخرية تربط السيرفر بمزاج الكابتن في النص التاني",
+    "مقارنة المدافع بأجهزة الجمارك لما تلاق اتصال ضعيف",
 ]
 _STYLE_SEEDS_EN: list[str] = [
+    # ── original seeds ──
     "short savage banter",
     "cold tech roast",
     "dry sarcastic jab",
     "football meme energy",
     "one-liner troll",
+    # ── guided improvisation ──
+    "unexpected Saudi-life comparison with tech twist",
+    "creative metaphor linking the squad to a crashing app",
+    "absurdist football debug humor",
 ]
 
 
-def generate_reply(tweet_text: str, lang_hint: str = "en") -> str:
-    """Generate a banter reply, retrying up to 3 times until quality_ok() passes."""
+def _build_user_prompt(tweet_text: str, lang_hint: str) -> tuple[str, str]:
+    """Return (seed, user_prompt) for the given tweet and language."""
     seed = random.choice(_STYLE_SEEDS_AR if lang_hint == "ar" else _STYLE_SEEDS_EN)
-
-    # English user prompt includes explicit banter-token reminder
     if lang_hint == "en":
         structure_line = (
             "Must follow the 3-part structure: "
@@ -547,39 +587,99 @@ def generate_reply(tweet_text: str, lang_hint: str = "en") -> str:
             "Must follow the 3-part structure: "
             "(1) jab at the club/situation  (2) tech metaphor  (3) sharp meme-like punchline."
         )
-
     user_prompt = (
         f"Style seed: {seed}\n\n"
         f"Target tweet:\n{tweet_text}\n\n"
         f"Write ONE reply tweet now. {structure_line}"
     )
+    return seed, user_prompt
+
+
+def _quality_check_candidate(reply: str, lang_hint: str, attempt: int,
+                              recent_metaphors: list[str], engine_tag: str) -> str | None:
+    """Run quality gate + anti-repeat. Returns tech metaphor on pass, None on fail."""
+    if not quality_ok(reply, lang_hint):
+        if looks_generic(reply):
+            block_reason = "generic_match"
+        else:
+            _has_tech = has_tech_metaphor(reply)
+            _has_jab  = has_club_jab(reply)
+            _has_sar  = has_sarcasm_marker(reply)
+            _score    = sum([_has_tech, _has_jab, _has_sar])
+            block_reason = "weak_sarcasm" if (_score < 2 and not _has_sar) else "missing_signals"
+        log.info(f"[{engine_tag}] Identity gate: attempt {attempt + 1}/3 BLOCK={block_reason} → retrying")
+        return None
+
+    metaphor = _extract_tech_metaphor(reply)
+    if metaphor and metaphor in recent_metaphors:
+        log.info(f"[{engine_tag}] Identity gate: attempt {attempt + 1}/3 BLOCK=repeated_metaphor({metaphor}) → retrying")
+        return None
+
+    if attempt > 0:
+        log.info(f"[{engine_tag}] Identity gate: passed on attempt {attempt + 1}")
+    return metaphor or ""   # empty string = no metaphor found (still a pass)
+
+
+def _generate_gemini(tweet_text: str, lang_hint: str = "en",
+                     state: dict | None = None) -> str:
+    """Generate reply via Gemini gemini-1.5-flash.
+
+    Returns FALLBACK_REPLY if all API calls raise exceptions (cycle never stops).
+    Returns '' if LLM responded but quality gate kept rejecting (caller skips tweet).
+    """
+    global _gemini_client
+    if _gemini_client is None:
+        key = (os.getenv("GEMINI_API_KEY") or "").strip()
+        if not key:
+            raise RuntimeError("GEN_ENGINE=gemini requires GEMINI_API_KEY")
+        genai.configure(api_key=key)
+        _gemini_client = genai.GenerativeModel(
+            "gemini-1.5-flash",
+            system_instruction=GEMINI_CONSTITUTION,
+        )
+        log.info("Engine: Gemini (gemini-1.5-flash) – client ready")
+
+    _, user_prompt = _build_user_prompt(tweet_text, lang_hint)
+    recent_metaphors: list[str] = (state or {}).get("recent_metaphors", [])
+    api_error_count = 0
+
     for attempt in range(3):
         try:
-            resp = ai.chat.completions.create(
-                model=OPENAI_MODEL,
-                messages=[
-                    {"role": "system", "content": SYSTEM_CONSTITUTION},
-                    {"role": "user",   "content": user_prompt},
-                ],
-                temperature=min(0.90 + attempt * 0.05, 1.1),
-                max_completion_tokens=120,
+            resp = _gemini_client.generate_content(
+                user_prompt,
+                generation_config=genai.types.GenerationConfig(
+                    max_output_tokens=120,
+                    temperature=min(0.80 + attempt * 0.05, 1.0),
+                ),
             )
-            text  = (resp.choices[0].message.content or "").strip()
+            text  = (resp.text or "").strip()
             reply = " ".join(text.splitlines()).strip()[:240]
 
-            if quality_ok(reply, lang_hint):
-                if attempt > 0:
-                    log.info(f"Identity gate: passed on attempt {attempt + 1}")
-                return reply
+            metaphor = _quality_check_candidate(reply, lang_hint, attempt, recent_metaphors, "Gemini")
+            if metaphor is None:
+                continue
 
-            log.info(f"Identity gate: attempt {attempt + 1}/3 failed quality_ok → retrying")
+            if state is not None and metaphor:
+                state.setdefault("recent_metaphors", []).append(metaphor)
+                state["recent_metaphors"] = state["recent_metaphors"][-20:]
+            return reply
+
         except Exception as e:
-            log.warning(f"OpenAI error (attempt {attempt + 1}): {e}")
+            api_error_count += 1
+            log.error("[Gemini] LLM fail (attempt %d): %s", attempt + 1, e)
 
-    # Fallback – guaranteed to be safe and on-brand
-    if lang_hint == "ar":
-        return "VAR راجع الحركة… السيرفر وقف. ⚽🤖"
-    return "VAR stuck in an infinite loop – system timeout. ⚽🤖"
+    if api_error_count == 3:
+        log.warning("[Gemini] All 3 API calls failed – using text fallback, cycle continues")
+        return FALLBACK_REPLY
+
+    log.warning("[Gemini] All 3 attempts failed quality gate – tweet will be skipped")
+    return ""
+
+
+def generate_reply(tweet_text: str, lang_hint: str = "en",
+                   state: dict | None = None) -> str:
+    """Generate a reply via Gemini. Returns '' on failure – caller skips tweet."""
+    return _generate_gemini(tweet_text, lang_hint, state)
 
 
 def detect_arabic(text: str) -> bool:
@@ -597,13 +697,25 @@ x = tweepy.Client(
 )
 
 
+def _block_reason(text: str, lang_hint: str) -> str:
+    """Return a specific BLOCK reason code for logging when quality_ok() fails."""
+    if looks_generic(text):
+        return "generic_match"
+    _has_tech = has_tech_metaphor(text)
+    _has_jab  = has_club_jab(text)
+    _has_sar  = has_sarcasm_marker(text)
+    if sum([_has_tech, _has_jab, _has_sar]) < 2 and not _has_sar:
+        return "weak_sarcasm"
+    return "missing_signals"
+
+
 def post_reply(state: dict, in_reply_to_tweet_id: int, text: str,
                lang_hint: str = "en") -> None:
     # Final quality gate – last line of defence before create_tweet
     if not quality_ok(text, lang_hint):
+        reason = _block_reason(text, lang_hint)
         log.warning(
-            "[BLOCKED] quality gate failed – reply suppressed "
-            "(score<2 or generic or no EN token) | %r", text[:80]
+            "[BLOCKED] reply suppressed BLOCK=%s | %r", reason, text[:80]
         )
         return
     if DRY_RUN:
@@ -617,9 +729,9 @@ def post_reply(state: dict, in_reply_to_tweet_id: int, text: str,
 def post_tweet(state: dict, text: str, lang_hint: str = "ar") -> None:
     # Final quality gate – last line of defence before create_tweet
     if not quality_ok(text, lang_hint):
+        reason = _block_reason(text, lang_hint)
         log.warning(
-            "[BLOCKED] quality gate failed – tweet suppressed "
-            "(score<2 or generic or no EN token) | %r", text[:80]
+            "[BLOCKED] tweet suppressed BLOCK=%s | %r", reason, text[:80]
         )
         return
     if DRY_RUN:
@@ -665,7 +777,7 @@ def run_recovery_mode(state: dict) -> None:
     base = "الدوري هذا كأنه سيرفر تحت ضغط… اللي دفاعه يهنق لا يلوم إلا نفسه."
     reply = ""
     for attempt in range(3):
-        cand = generate_reply(base, lang_hint="ar")
+        cand = generate_reply(base, lang_hint="ar", state=state)
         if quality_ok(cand, "ar"):
             reply = cand
             break
@@ -696,7 +808,7 @@ def monitor_mentions_and_snipes() -> None:
     my_id = me.data.id
 
     log.info("=" * 60)
-    log.info(f"BugKSA online  my_id={my_id}  DRY_RUN={DRY_RUN}  RECOVERY_MODE={RECOVERY_MODE}")
+    log.info(f"BugKSA online  my_id={my_id}  DRY_RUN={DRY_RUN}  RECOVERY_MODE={RECOVERY_MODE}  GEN_ENGINE={GEN_ENGINE}")
     log.info(
         f"Governor: gap≥{MIN_GAP_SECONDS // 60}min | burst≤{DERBY_BURST_MAX_30MIN}/30min | "
         f"{MAX_PER_HOUR}/hr | {MAX_PER_DAY}/day | humanize_skip={int(HUMANIZE_SKIP_RATE * 100)}%"
@@ -748,7 +860,7 @@ def monitor_mentions_and_snipes() -> None:
                     lang_hint = "ar" if detect_arabic(tw.text) else "en"
                     reply = ""
                     for attempt in range(3):
-                        cand = generate_reply(tw.text, lang_hint=lang_hint)
+                        cand = generate_reply(tw.text, lang_hint=lang_hint, state=state)
                         if quality_ok(cand, lang_hint):
                             reply = cand
                             break
@@ -816,7 +928,7 @@ def monitor_mentions_and_snipes() -> None:
                     lang_hint = "ar" if detect_arabic(tw.text) else "en"
                     reply = ""
                     for attempt in range(3):
-                        cand = generate_reply(tw.text, lang_hint=lang_hint)
+                        cand = generate_reply(tw.text, lang_hint=lang_hint, state=state)
                         if quality_ok(cand, lang_hint):
                             reply = cand
                             break
