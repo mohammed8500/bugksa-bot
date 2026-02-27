@@ -387,6 +387,7 @@ def load_state() -> dict:
     s.setdefault("derby_burst_log",   [])   # timestamps in last 30 min
     s.setdefault("next_action_after", 0.0)  # humanized gate: earliest allowed next post
     s.setdefault("recent_metaphors",  [])   # anti-repeat: last 20 tech keywords used
+    s.setdefault("liked_tweet_ids",   [])   # engage-before-reply: tweets already liked
 
     # ── One-time migration: drop legacy recovery_tweets_log (old cap=3 system) ──
     stale = s.pop("recovery_tweets_log", None)
@@ -407,6 +408,7 @@ def load_state() -> dict:
 
 def save_state(state: dict) -> None:
     state["replied_tweet_ids"] = state.get("replied_tweet_ids", [])[-500:]
+    state["liked_tweet_ids"]   = state.get("liked_tweet_ids",   [])[-500:]
     cutoff_24h = now_ts() - 86400
     state["actions_log"]      = [t for t in state.get("actions_log",      []) if t >= cutoff_24h]
     cutoff_30m = now_ts() - 1800
@@ -714,6 +716,27 @@ def _block_reason(text: str, lang_hint: str) -> str:
     return "missing_signals"
 
 
+def _snipe_engage(tweet_id: int, my_id: int,
+                  liked_set: set[str], state: dict) -> None:
+    """Like *tweet_id* (if not already liked) then wait 2-4 s.
+
+    This satisfies X's "engage before reply" conversation-control rule.
+    Errors are swallowed so a like failure never blocks the reply attempt.
+    """
+    tid = str(tweet_id)
+    if tid in liked_set:
+        return
+    try:
+        if not DRY_RUN:
+            x.like(my_id, tweet_id, user_auth=True)
+        log.info("Snipe engage: liked tweet %s", tid)
+    except Exception as like_err:
+        log.warning("Snipe engage: like failed (%s) – proceeding anyway", like_err)
+    liked_set.add(tid)
+    state["liked_tweet_ids"].append(tid)
+    time.sleep(random.uniform(2, 4))
+
+
 def post_reply(state: dict, in_reply_to_tweet_id: int, text: str,
                lang_hint: str = "en") -> None:
     # Final quality gate – last line of defence before create_tweet
@@ -806,6 +829,7 @@ def run_recovery_mode(state: dict) -> None:
 def monitor_mentions_and_snipes() -> None:
     state = load_state()
     replied_set: set[str] = set(state.get("replied_tweet_ids", []))
+    liked_set:   set[str] = set(state.get("liked_tweet_ids",   []))
 
     me = x.get_me(user_auth=True)
     if not me or not me.data:
@@ -952,8 +976,25 @@ def monitor_mentions_and_snipes() -> None:
                             save_state(state)
                             continue
 
+                        # Engage-before-reply: like the tweet first so X allows our reply
+                        _snipe_engage(tw.id, my_id, liked_set, state)
+
                         log.info(f"Snipe @{uname}: replying → {reply}")
-                        post_reply(state, tw.id, reply, lang_hint)
+                        try:
+                            post_reply(state, tw.id, reply, lang_hint)
+                        except Exception as reply_err:
+                            err_str = str(reply_err).lower()
+                            if ("not allowed" in err_str or "conversation" in err_str
+                                    or "mentioned" in err_str):
+                                log.warning(
+                                    "Snipe @%s %s: reply blocked by conversation control",
+                                    uname, tid,
+                                )
+                                replied_set.add(tid)
+                                state["replied_tweet_ids"].append(tid)
+                                save_state(state)
+                                continue
+                            raise
                         replied_set.add(tid)
                         state["replied_tweet_ids"].append(tid)
                         if derby:
