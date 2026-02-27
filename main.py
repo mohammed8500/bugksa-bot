@@ -19,6 +19,7 @@ from pathlib import Path
 
 import tweepy
 from openai import OpenAI
+import google.generativeai as genai
 
 # ── Logging ───────────────────────────────────────────────────────────────────
 
@@ -39,8 +40,17 @@ def env(name: str, required: bool = True) -> str:
     return v
 
 
-OPENAI_API_KEY  = env("OPENAI_API_KEY")
-OPENAI_MODEL    = (os.getenv("OPENAI_MODEL") or "gpt-4o-mini").strip()
+GEN_ENGINE      = (os.getenv("GEN_ENGINE") or "openai").strip().lower()  # "openai" | "gemini"
+
+if GEN_ENGINE == "gemini":
+    GEMINI_API_KEY  = env("GEMINI_API_KEY")
+    OPENAI_API_KEY  = ""
+    OPENAI_MODEL    = ""
+else:
+    OPENAI_API_KEY  = env("OPENAI_API_KEY")
+    OPENAI_MODEL    = (os.getenv("OPENAI_MODEL") or "gpt-4o-mini").strip()
+    GEMINI_API_KEY  = ""
+
 X_API_KEY       = env("X_API_KEY")
 X_API_SECRET    = env("X_API_SECRET")
 X_ACCESS_TOKEN  = env("X_ACCESS_TOKEN")
@@ -472,9 +482,20 @@ def governor_allows(state: dict, derby: bool = False) -> tuple[bool, str]:
     return True, "ok"
 
 
-# ── OpenAI client ─────────────────────────────────────────────────────────────
+# ── AI client – initialised once based on GEN_ENGINE ─────────────────────────
 
-ai = OpenAI(api_key=OPENAI_API_KEY)
+if GEN_ENGINE == "gemini":
+    genai.configure(api_key=GEMINI_API_KEY)
+    _gemini_client = genai.GenerativeModel(
+        "gemini-1.5-flash",
+        system_instruction=GEMINI_CONSTITUTION,
+    )
+    ai = None
+    log.info(f"Engine: Gemini (gemini-1.5-flash)")
+else:
+    ai = OpenAI(api_key=OPENAI_API_KEY)
+    _gemini_client = None
+    log.info(f"Engine: OpenAI ({OPENAI_MODEL})")
 
 # ── SYSTEM CONSTITUTION (BugKSA identity – non-negotiable) ───────────────────
 
@@ -541,6 +562,66 @@ You are @BugKSA – a Saudi football banter account. NOT a sports journalist. NO
   8. Single punchy line ≤240 characters
 """
 
+# ── GEMINI CONSTITUTION (90/10 ratio – Saudi طقطقة dominant) ─────────────────
+# Used ONLY when GEN_ENGINE=gemini. Tuned to Gemini's instruction-following style.
+
+GEMINI_CONSTITUTION = """\
+أنت @BugKSA – حساب طقطقة كروية سعودية. لست صحفياً رياضياً. لست بوت أخبار.
+
+═══ الهوية (غير قابلة للتغيير) ═══
+• النسبة: 90% طقطقة شعبية سعودية حارة + 10% مصطلحات تقنية
+• الأسلوب: قصير · ضربة واحدة · طاقة ميم – لا تحليل صحفي أبداً
+• محتوى آمن فقط: لا كراهية، لا تحرش، لا سياسة، لا دين
+
+═══ قاعدة اللغة ═══
+• رد بنفس لغة التغريدة المستهدفة
+• تغريدة عربية → رد بالسعودي العامي (المصطلحات التقنية بالإنجليزي مقبولة: Bug، Lag، 404)
+• تغريدة إنجليزية → رد إنجليزي فقط
+• لا تخلط اللغتين أبداً
+
+═══ الهيكل الإلزامي 3 أجزاء (الثلاثة مطلوبة في كل رد) ═══
+  PART 1 → الطعنة/الهجوم    – وجّه الطقطقة على النادي أو الموقف
+  PART 2 → الاستعارة التقنية – ادرج مصطلح تقني واحد بشكل طبيعي
+  PART 3 → القفلة            – اقفل النكتة: غير متوقعة، حادة، نهاية مثل الميم
+
+  مثال (عربي):    "الدفاع crash كامل، والـ VAR بعد شايل null pointer 🤦‍♂️"
+  مثال (إنجليزي): "That defending just triggered a full server meltdown – 404 tactics not found 💀"
+
+═══ ENGLISH BANTER TOKENS – استخدم ≥1 في كل رد إنجليزي ═══
+  Man Utd     → "museum FC"  · "404 trophies"  · "nostalgia build"
+  Chelsea     → "billion-dollar beta"  · "chaos patch"  · "no stable release"
+  Arsenal     → "almost FC"  · "beta champions"  · "April crash"
+  Tottenham   → "no-trophy mode"  · "empty cabinet.exe"  · "bottle.exe"
+  Liverpool   → "pressing.exe stuck"  · "VAR dependency"  · "legacy cache"
+  Man City    → "financial plugin"  · "115 charges edition"
+  Barcelona   → "economic levers"  · "debt mode"  · "ghost payroll"
+  Real Madrid → "UCL script"  · "plot armor"  · "final boss mode"
+
+═══ ممنوع كلياً – إذا ظهر أي منها أعد التوليد فوراً ═══
+  ✗ "ما شاء الله"  ·  "الله يوفقهم"  ·  "بالتوفيق"  ·  "عاشوا"  ·  "شاطرين"
+  ✗ "مباراة ممتعة"  ·  "مباراة رائعة"  ·  "مستوى عالٍ"  ·  "أداء متميز"
+  ✗ "great match"  ·  "well played"  ·  "impressive performance"  ·  "both teams"
+  ✗ أي جملة يمكن لصحفي رياضي أن يكتبها بدون خجل
+  ✗ أكثر من جملة واحدة (سطر واحد حاد فقط)
+  ✗ هاشتاقات (#) أو إشارات (@)
+
+═══ المفردات التقنية المسموح بها ═══
+  Lag · Timeout · Bug · 404 · Patch · Deployment failed · Memory leak ·
+  Server crash · Firewall breach · Cache clear · Kernel panic · Null pointer ·
+  CPU overload · Rollback · Hotfix · Debug mode · Ping spike ·
+  سيرفر · لاق · باق · تايم أوت · كاش
+
+═══ تحقق ذاتي قبل الإرسال (أعد التوليد إذا فشل أي منها) ═══
+  1. اللغة تطابق التغريدة المستهدفة
+  2. PART 1 (الطعنة) موجودة
+  3. PART 2 (المصطلح التقني) موجودة
+  4. PART 3 (القفلة) حادة ومفاجئة
+  5. للردود الإنجليزية: ≥1 banter token من القائمة أعلاه
+  6. صفر صياغة صحفية أو تحليل محايد
+  7. المحتوى آمن ونظيف
+  8. سطر واحد حاد ≤240 حرف
+"""
+
 # Style seeds drive creative variety
 _STYLE_SEEDS_AR: list[str] = [
     # ── original seeds ──
@@ -571,19 +652,9 @@ _STYLE_SEEDS_EN: list[str] = [
 ]
 
 
-def generate_reply(tweet_text: str, lang_hint: str = "en",
-                   state: dict | None = None) -> str:
-    """Generate a banter reply, retrying up to 3 times until quality_ok() passes.
-
-    Enhancements (additive – original logic preserved):
-      • Temperature starts at 0.8 (guided improvisation sweet-spot)
-      • Anti-repeat: skips replies whose tech metaphor appeared in the last 20 replies
-      • BLOCK logging: emits a specific reason code for each rejection
-    """
+def _build_user_prompt(tweet_text: str, lang_hint: str) -> tuple[str, str]:
+    """Return (seed, user_prompt) for the given tweet and language."""
     seed = random.choice(_STYLE_SEEDS_AR if lang_hint == "ar" else _STYLE_SEEDS_EN)
-    recent_metaphors: list[str] = (state or {}).get("recent_metaphors", [])
-
-    # English user prompt includes explicit banter-token reminder
     if lang_hint == "en":
         structure_line = (
             "Must follow the 3-part structure: "
@@ -597,12 +668,45 @@ def generate_reply(tweet_text: str, lang_hint: str = "en",
             "Must follow the 3-part structure: "
             "(1) jab at the club/situation  (2) tech metaphor  (3) sharp meme-like punchline."
         )
-
     user_prompt = (
         f"Style seed: {seed}\n\n"
         f"Target tweet:\n{tweet_text}\n\n"
         f"Write ONE reply tweet now. {structure_line}"
     )
+    return seed, user_prompt
+
+
+def _quality_check_candidate(reply: str, lang_hint: str, attempt: int,
+                              recent_metaphors: list[str], engine_tag: str) -> str | None:
+    """Run quality gate + anti-repeat. Returns tech metaphor on pass, None on fail."""
+    if not quality_ok(reply, lang_hint):
+        if looks_generic(reply):
+            block_reason = "generic_match"
+        else:
+            _has_tech = has_tech_metaphor(reply)
+            _has_jab  = has_club_jab(reply)
+            _has_sar  = has_sarcasm_marker(reply)
+            _score    = sum([_has_tech, _has_jab, _has_sar])
+            block_reason = "weak_sarcasm" if (_score < 2 and not _has_sar) else "missing_signals"
+        log.info(f"[{engine_tag}] Identity gate: attempt {attempt + 1}/3 BLOCK={block_reason} → retrying")
+        return None
+
+    metaphor = _extract_tech_metaphor(reply)
+    if metaphor and metaphor in recent_metaphors:
+        log.info(f"[{engine_tag}] Identity gate: attempt {attempt + 1}/3 BLOCK=repeated_metaphor({metaphor}) → retrying")
+        return None
+
+    if attempt > 0:
+        log.info(f"[{engine_tag}] Identity gate: passed on attempt {attempt + 1}")
+    return metaphor or ""   # empty string = no metaphor found (still a pass)
+
+
+def _generate_openai(tweet_text: str, lang_hint: str = "en",
+                     state: dict | None = None) -> str:
+    """Generate reply via OpenAI gpt-4o-mini. Returns '' if all attempts fail (caller skips tweet)."""
+    _, user_prompt = _build_user_prompt(tweet_text, lang_hint)
+    recent_metaphors: list[str] = (state or {}).get("recent_metaphors", [])
+
     for attempt in range(3):
         try:
             resp = ai.chat.completions.create(
@@ -611,58 +715,73 @@ def generate_reply(tweet_text: str, lang_hint: str = "en",
                     {"role": "system", "content": SYSTEM_CONSTITUTION},
                     {"role": "user",   "content": user_prompt},
                 ],
-                temperature=min(0.80 + attempt * 0.05, 1.0),  # guided improvisation: 0.80→0.85→0.90
+                temperature=min(0.80 + attempt * 0.05, 1.0),
                 max_completion_tokens=120,
             )
             text  = (resp.choices[0].message.content or "").strip()
             reply = " ".join(text.splitlines()).strip()[:240]
 
-            # ── Quality gate with detailed BLOCK reason logging ────────────────
-            if not quality_ok(reply, lang_hint):
-                if looks_generic(reply):
-                    block_reason = "generic_match"
-                else:
-                    _has_tech = has_tech_metaphor(reply)
-                    _has_jab  = has_club_jab(reply)
-                    _has_sar  = has_sarcasm_marker(reply)
-                    _score    = sum([_has_tech, _has_jab, _has_sar])
-                    if _score < 2 and not _has_sar:
-                        block_reason = "weak_sarcasm"
-                    else:
-                        block_reason = "missing_signals"
-                log.info(
-                    f"Identity gate: attempt {attempt + 1}/3 "
-                    f"BLOCK={block_reason} → retrying"
-                )
+            metaphor = _quality_check_candidate(reply, lang_hint, attempt, recent_metaphors, "OpenAI")
+            if metaphor is None:
                 continue
 
-            # ── Anti-repeat: reject if same tech metaphor used recently ───────
-            metaphor = _extract_tech_metaphor(reply)
-            if metaphor and metaphor in recent_metaphors:
-                log.info(
-                    f"Identity gate: attempt {attempt + 1}/3 "
-                    f"BLOCK=repeated_metaphor({metaphor}) → retrying"
-                )
-                continue
-
-            # ── Passed all gates ───────────────────────────────────────────────
-            if attempt > 0:
-                log.info(f"Identity gate: passed on attempt {attempt + 1}")
-
-            # Track metaphor in state for future anti-repeat checks
             if state is not None and metaphor:
                 state.setdefault("recent_metaphors", []).append(metaphor)
                 state["recent_metaphors"] = state["recent_metaphors"][-20:]
-
             return reply
 
         except Exception as e:
-            log.warning(f"OpenAI error (attempt {attempt + 1}): {e}")
+            log.warning(f"[OpenAI] engine error (attempt {attempt + 1}): {e}")
 
-    # Fallback – guaranteed to be safe and on-brand
-    if lang_hint == "ar":
-        return "VAR راجع الحركة… السيرفر وقف. ⚽🤖"
-    return "VAR stuck in an infinite loop – system timeout. ⚽🤖"
+    log.warning("[OpenAI] All 3 attempts failed – tweet will be skipped")
+    return ""
+
+
+def _generate_gemini(tweet_text: str, lang_hint: str = "en",
+                     state: dict | None = None) -> str:
+    """Generate reply via Gemini gemini-1.5-flash. Returns '' if all attempts fail (caller skips tweet)."""
+    _, user_prompt = _build_user_prompt(tweet_text, lang_hint)
+    recent_metaphors: list[str] = (state or {}).get("recent_metaphors", [])
+
+    for attempt in range(3):
+        try:
+            resp = _gemini_client.generate_content(
+                user_prompt,
+                generation_config=genai.types.GenerationConfig(
+                    max_output_tokens=120,
+                    temperature=min(0.80 + attempt * 0.05, 1.0),
+                ),
+            )
+            text  = (resp.text or "").strip()
+            reply = " ".join(text.splitlines()).strip()[:240]
+
+            metaphor = _quality_check_candidate(reply, lang_hint, attempt, recent_metaphors, "Gemini")
+            if metaphor is None:
+                continue
+
+            if state is not None and metaphor:
+                state.setdefault("recent_metaphors", []).append(metaphor)
+                state["recent_metaphors"] = state["recent_metaphors"][-20:]
+            return reply
+
+        except Exception as e:
+            log.warning(f"[Gemini] engine error (attempt {attempt + 1}): {e}")
+
+    log.warning("[Gemini] All 3 attempts failed – tweet will be skipped")
+    return ""
+
+
+def generate_reply(tweet_text: str, lang_hint: str = "en",
+                   state: dict | None = None) -> str:
+    """Route to the active engine (GEN_ENGINE). Returns '' on failure – caller skips tweet.
+
+    No automatic fallback between engines by design (Full Toggle):
+      GEN_ENGINE=openai → OpenAI only
+      GEN_ENGINE=gemini → Gemini only
+    """
+    if GEN_ENGINE == "gemini":
+        return _generate_gemini(tweet_text, lang_hint, state)
+    return _generate_openai(tweet_text, lang_hint, state)
 
 
 def detect_arabic(text: str) -> bool:
@@ -791,7 +910,7 @@ def monitor_mentions_and_snipes() -> None:
     my_id = me.data.id
 
     log.info("=" * 60)
-    log.info(f"BugKSA online  my_id={my_id}  DRY_RUN={DRY_RUN}  RECOVERY_MODE={RECOVERY_MODE}")
+    log.info(f"BugKSA online  my_id={my_id}  DRY_RUN={DRY_RUN}  RECOVERY_MODE={RECOVERY_MODE}  GEN_ENGINE={GEN_ENGINE}")
     log.info(
         f"Governor: gap≥{MIN_GAP_SECONDS // 60}min | burst≤{DERBY_BURST_MAX_30MIN}/30min | "
         f"{MAX_PER_HOUR}/hr | {MAX_PER_DAY}/day | humanize_skip={int(HUMANIZE_SKIP_RATE * 100)}%"
