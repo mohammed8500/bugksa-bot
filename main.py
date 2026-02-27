@@ -132,16 +132,30 @@ RIVAL_PAIRS: list[tuple[str, str]] = [
 
 # Generic / journalist phrases → auto-reject
 _GENERIC_PHRASES: list[str] = [
-    # English
+    # English – original
     "stats are crazy", "this season", "great match", "good result",
     "well played", "played well", "impressive performance", "both teams",
     "exciting game", "strong performance", "tough match", "quality football",
     "incredible match", "wow what a", "what a game", "great game",
     "dominated the", "very competitive", "amazing display",
-    # Arabic
+    # English – new cold/journalist phrases
+    "very impressive", "what a performance", "top quality",
+    "played brilliantly", "superb display", "clinical finishing",
+    "outstanding result", "absolutely incredible", "well deserved",
+    "great effort", "solid game", "nice result", "looking good",
+    "credit to both", "credit where it", "has to be said",
+    "gotta say", "not gonna lie", "ngl,", "honestly though",
+    "fair play to", "respect to",
+    # Arabic – original
     "إحصائيات رائعة", "أداء رائع", "كلا الفريقين", "مباراة ممتازة",
     "نتيجة جيدة", "أداء قوي", "لعبوا جيدًا", "لعبوا بشكل",
     "مباراة مثيرة", "مباراة رائعة",
+    # Arabic – new cold/journalist phrases
+    "مباراة حماسية", "تفوق واضح", "نتيجة متوقعة",
+    "أداء متميز", "مستوى عالٍ", "فريق قوي",
+    "انتصار مستحق", "أداء استثنائي", "مباراة قوية",
+    "الفريق بذل جهداً", "بالتوفيق للفريقين",
+    "ما شاء الله", "الله يوفقهم", "شاطرين", "عاشوا",
 ]
 
 # Tech keywords – at least one must appear (PART 2 of the 3-part structure)
@@ -271,6 +285,19 @@ def has_sarcasm_marker(text: str) -> bool:
 has_banter_energy = has_sarcasm_marker
 
 
+def _extract_tech_metaphor(text: str) -> str | None:
+    """Return the first tech keyword found in text (used for anti-repeat tracking).
+
+    Iterates _TECH_WORDS in sorted order for determinism.
+    Returns None if no tech word is present (reply will skip anti-repeat gate).
+    """
+    t = text.lower()
+    for w in sorted(_TECH_WORDS):
+        if w in t:
+            return w
+    return None
+
+
 def has_english_banter_token(text: str) -> bool:
     """English-specific check: reply must contain ≥1 club mock token.
 
@@ -355,6 +382,7 @@ def load_state() -> dict:
     s.setdefault("last_action_ts",    0)
     s.setdefault("derby_burst_log",   [])   # timestamps in last 30 min
     s.setdefault("next_action_after", 0.0)  # humanized gate: earliest allowed next post
+    s.setdefault("recent_metaphors",  [])   # anti-repeat: last 20 tech keywords used
 
     # ── One-time migration: drop legacy recovery_tweets_log (old cap=3 system) ──
     stale = s.pop("recovery_tweets_log", None)
@@ -379,6 +407,7 @@ def save_state(state: dict) -> None:
     state["actions_log"]      = [t for t in state.get("actions_log",      []) if t >= cutoff_24h]
     cutoff_30m = now_ts() - 1800
     state["derby_burst_log"]  = [t for t in state.get("derby_burst_log",  []) if t >= cutoff_30m]
+    state["recent_metaphors"] = state.get("recent_metaphors", [])[-20:]  # keep last 20
     tmp = STATE_FILE.with_suffix(".tmp")
     with tmp.open("w", encoding="utf-8") as f:
         json.dump(state, f, ensure_ascii=False, indent=2)
@@ -514,24 +543,45 @@ You are @BugKSA – a Saudi football banter account. NOT a sports journalist. NO
 
 # Style seeds drive creative variety
 _STYLE_SEEDS_AR: list[str] = [
+    # ── original seeds ──
     "طقطقة خفيفة مع قفلة سعودية",
     "مقلب تقني على الدفاع",
     "سخرية كروية سريعة",
     "ذبة قصيرة وتمون",
     "نفس مشجع فاصل بعد مباراة",
+    # ── guided improvisation: Saudi daily-life metaphors ──
+    "تشبيه الدفاع بشبكة اتصال واقفة في حفل",
+    "مقارنة الهجوم بطابور دوائر حكومية بعد الظهر",
+    "ذبة بروح جلسة قهوة سعودية بعد المباراة",
+    "تشبيه التكتيك بطلبية أوبر ما وصلت وما ألغت",
+    "سخرية تربط السيرفر بمزاج الكابتن في النص التاني",
+    "مقارنة المدافع بأجهزة الجمارك لما تلاق اتصال ضعيف",
 ]
 _STYLE_SEEDS_EN: list[str] = [
+    # ── original seeds ──
     "short savage banter",
     "cold tech roast",
     "dry sarcastic jab",
     "football meme energy",
     "one-liner troll",
+    # ── guided improvisation ──
+    "unexpected Saudi-life comparison with tech twist",
+    "creative metaphor linking the squad to a crashing app",
+    "absurdist football debug humor",
 ]
 
 
-def generate_reply(tweet_text: str, lang_hint: str = "en") -> str:
-    """Generate a banter reply, retrying up to 3 times until quality_ok() passes."""
+def generate_reply(tweet_text: str, lang_hint: str = "en",
+                   state: dict | None = None) -> str:
+    """Generate a banter reply, retrying up to 3 times until quality_ok() passes.
+
+    Enhancements (additive – original logic preserved):
+      • Temperature starts at 0.8 (guided improvisation sweet-spot)
+      • Anti-repeat: skips replies whose tech metaphor appeared in the last 20 replies
+      • BLOCK logging: emits a specific reason code for each rejection
+    """
     seed = random.choice(_STYLE_SEEDS_AR if lang_hint == "ar" else _STYLE_SEEDS_EN)
+    recent_metaphors: list[str] = (state or {}).get("recent_metaphors", [])
 
     # English user prompt includes explicit banter-token reminder
     if lang_hint == "en":
@@ -561,18 +611,51 @@ def generate_reply(tweet_text: str, lang_hint: str = "en") -> str:
                     {"role": "system", "content": SYSTEM_CONSTITUTION},
                     {"role": "user",   "content": user_prompt},
                 ],
-                temperature=min(0.90 + attempt * 0.05, 1.1),
+                temperature=min(0.80 + attempt * 0.05, 1.0),  # guided improvisation: 0.80→0.85→0.90
                 max_completion_tokens=120,
             )
             text  = (resp.choices[0].message.content or "").strip()
             reply = " ".join(text.splitlines()).strip()[:240]
 
-            if quality_ok(reply, lang_hint):
-                if attempt > 0:
-                    log.info(f"Identity gate: passed on attempt {attempt + 1}")
-                return reply
+            # ── Quality gate with detailed BLOCK reason logging ────────────────
+            if not quality_ok(reply, lang_hint):
+                if looks_generic(reply):
+                    block_reason = "generic_match"
+                else:
+                    _has_tech = has_tech_metaphor(reply)
+                    _has_jab  = has_club_jab(reply)
+                    _has_sar  = has_sarcasm_marker(reply)
+                    _score    = sum([_has_tech, _has_jab, _has_sar])
+                    if _score < 2 and not _has_sar:
+                        block_reason = "weak_sarcasm"
+                    else:
+                        block_reason = "missing_signals"
+                log.info(
+                    f"Identity gate: attempt {attempt + 1}/3 "
+                    f"BLOCK={block_reason} → retrying"
+                )
+                continue
 
-            log.info(f"Identity gate: attempt {attempt + 1}/3 failed quality_ok → retrying")
+            # ── Anti-repeat: reject if same tech metaphor used recently ───────
+            metaphor = _extract_tech_metaphor(reply)
+            if metaphor and metaphor in recent_metaphors:
+                log.info(
+                    f"Identity gate: attempt {attempt + 1}/3 "
+                    f"BLOCK=repeated_metaphor({metaphor}) → retrying"
+                )
+                continue
+
+            # ── Passed all gates ───────────────────────────────────────────────
+            if attempt > 0:
+                log.info(f"Identity gate: passed on attempt {attempt + 1}")
+
+            # Track metaphor in state for future anti-repeat checks
+            if state is not None and metaphor:
+                state.setdefault("recent_metaphors", []).append(metaphor)
+                state["recent_metaphors"] = state["recent_metaphors"][-20:]
+
+            return reply
+
         except Exception as e:
             log.warning(f"OpenAI error (attempt {attempt + 1}): {e}")
 
@@ -597,13 +680,25 @@ x = tweepy.Client(
 )
 
 
+def _block_reason(text: str, lang_hint: str) -> str:
+    """Return a specific BLOCK reason code for logging when quality_ok() fails."""
+    if looks_generic(text):
+        return "generic_match"
+    _has_tech = has_tech_metaphor(text)
+    _has_jab  = has_club_jab(text)
+    _has_sar  = has_sarcasm_marker(text)
+    if sum([_has_tech, _has_jab, _has_sar]) < 2 and not _has_sar:
+        return "weak_sarcasm"
+    return "missing_signals"
+
+
 def post_reply(state: dict, in_reply_to_tweet_id: int, text: str,
                lang_hint: str = "en") -> None:
     # Final quality gate – last line of defence before create_tweet
     if not quality_ok(text, lang_hint):
+        reason = _block_reason(text, lang_hint)
         log.warning(
-            "[BLOCKED] quality gate failed – reply suppressed "
-            "(score<2 or generic or no EN token) | %r", text[:80]
+            "[BLOCKED] reply suppressed BLOCK=%s | %r", reason, text[:80]
         )
         return
     if DRY_RUN:
@@ -617,9 +712,9 @@ def post_reply(state: dict, in_reply_to_tweet_id: int, text: str,
 def post_tweet(state: dict, text: str, lang_hint: str = "ar") -> None:
     # Final quality gate – last line of defence before create_tweet
     if not quality_ok(text, lang_hint):
+        reason = _block_reason(text, lang_hint)
         log.warning(
-            "[BLOCKED] quality gate failed – tweet suppressed "
-            "(score<2 or generic or no EN token) | %r", text[:80]
+            "[BLOCKED] tweet suppressed BLOCK=%s | %r", reason, text[:80]
         )
         return
     if DRY_RUN:
@@ -665,7 +760,7 @@ def run_recovery_mode(state: dict) -> None:
     base = "الدوري هذا كأنه سيرفر تحت ضغط… اللي دفاعه يهنق لا يلوم إلا نفسه."
     reply = ""
     for attempt in range(3):
-        cand = generate_reply(base, lang_hint="ar")
+        cand = generate_reply(base, lang_hint="ar", state=state)
         if quality_ok(cand, "ar"):
             reply = cand
             break
@@ -748,7 +843,7 @@ def monitor_mentions_and_snipes() -> None:
                     lang_hint = "ar" if detect_arabic(tw.text) else "en"
                     reply = ""
                     for attempt in range(3):
-                        cand = generate_reply(tw.text, lang_hint=lang_hint)
+                        cand = generate_reply(tw.text, lang_hint=lang_hint, state=state)
                         if quality_ok(cand, lang_hint):
                             reply = cand
                             break
@@ -816,7 +911,7 @@ def monitor_mentions_and_snipes() -> None:
                     lang_hint = "ar" if detect_arabic(tw.text) else "en"
                     reply = ""
                     for attempt in range(3):
-                        cand = generate_reply(tw.text, lang_hint=lang_hint)
+                        cand = generate_reply(tw.text, lang_hint=lang_hint, state=state)
                         if quality_ok(cand, lang_hint):
                             reply = cand
                             break
