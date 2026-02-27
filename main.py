@@ -951,8 +951,16 @@ def monitor_mentions_and_snipes() -> None:
                     did_action = True
 
         except Exception as e:
-            log.error(f"Cycle error: {e}")
-            time.sleep(60)
+            # 402 = credits exhausted – sleep 1 h, don't hammer the API
+            if "402" in str(e) or "payment required" in str(e).lower():
+                log.critical(
+                    "CREDITS EXHAUSTED (402) – top up at developer.x.com "
+                    "Sleeping 1 h before retry."
+                )
+                time.sleep(3600)
+            else:
+                log.error(f"Cycle error: {e}")
+                time.sleep(60)
             continue
 
         if not did_action:
