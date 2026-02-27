@@ -6,7 +6,7 @@ Saudi football banter.  Every post goes through a 3-layer safety stack:
 
   Layer 1 – Anti-spam governor  (HARD limits, never overridden)
   Layer 2 – Identity gate        (quality_ok() blocks generic/journalist output)
-  Layer 3 – OpenAI constitution  (SYSTEM_CONSTITUTION enforces 3-part structure)
+  Layer 3 – Gemini constitution  (GEMINI_CONSTITUTION enforces 3-part structure)
 """
 
 import os
@@ -18,7 +18,6 @@ import logging
 from pathlib import Path
 
 import tweepy
-from openai import OpenAI
 import google.generativeai as genai
 
 # ── Logging ───────────────────────────────────────────────────────────────────
@@ -40,11 +39,7 @@ def env(name: str, required: bool = True) -> str:
     return v
 
 
-GEN_ENGINE   = (os.getenv("GEN_ENGINE") or "gemini").strip().lower()  # "openai" | "gemini"
-OPENAI_MODEL = (os.getenv("OPENAI_MODEL") or "gpt-4o-mini").strip()
-
-if GEN_ENGINE not in ("openai", "gemini"):
-    raise RuntimeError(f"Invalid GEN_ENGINE: {GEN_ENGINE!r} – must be 'openai' or 'gemini'")
+GEN_ENGINE = "gemini"
 
 X_API_KEY       = env("X_API_KEY")
 X_API_SECRET    = env("X_API_SECRET")
@@ -477,84 +472,17 @@ def governor_allows(state: dict, derby: bool = False) -> tuple[bool, str]:
     return True, "ok"
 
 
-# ── AI clients – lazy-initialised on first call inside generate functions ─────
+# ── AI client – lazy-initialised on first generate call ──────────────────────
 
-_openai_client: "OpenAI | None" = None
 _gemini_client: "genai.GenerativeModel | None" = None
 
-log.info(f"Engine: {GEN_ENGINE.upper()} (lazy init)")
+log.info("Engine: GEMINI (lazy init)")
 
 # ── Fallback reply (used when LLM API fails completely) ───────────────────────
 # Passes quality_ok() for both "ar" and "en": tech(سيرفر) + sarcasm(😂 !) = 2/3
 FALLBACK_REPLY = "السيرفر يهنق والمباراة ما وقفت! 😂 هذا الدوري مو رحيم"
 
-# ── SYSTEM CONSTITUTION (BugKSA identity – non-negotiable) ───────────────────
-
-SYSTEM_CONSTITUTION = """\
-You are @BugKSA – a Saudi football banter account. NOT a sports journalist. NOT a news bot.
-
-═══ IDENTITY (NON-NEGOTIABLE) ═══
-• Ratio: 80 % Saudi football sarcasm/طقطقة + 20 % tech metaphors
-• Tone: short · punchy · meme-like cadence – NEVER journalist-style or neutral analysis
-• Safe sarcasm ONLY: no hate, harassment, slurs, doxxing, sexual content, politics, religion
-
-═══ LANGUAGE RULE ═══
-• Reply in the SAME language as the target tweet
-• Arabic tweet → Saudi Arabic reply  (tech terms in English are OK: Bug, Lag, 404)
-• English tweet → English reply ONLY
-• NEVER mix languages in one reply
-
-═══ MANDATORY 3-PART STRUCTURE (all three required in every reply) ═══
-  PART 1 → TARGET/JAB    – aim the banter at the club, match, or situation
-  PART 2 → TECH METAPHOR – weave in ONE tech keyword naturally
-  PART 3 → PUNCHLINE     – land the joke: unexpected, sharp, meme-like ending
-
-  Example (Arabic):  "الدفاع crash كامل، والـ VAR بعد شايل null pointer 🤦‍♂️"
-  Example (English): "That defending just triggered a full server meltdown – 404 tactics not found 💀"
-
-═══ ENGLISH BANTER TOKENS – use ≥1 per English reply ═══
-  Man Utd     → "museum FC"  · "404 trophies"  · "nostalgia build"
-  Chelsea     → "billion-dollar beta"  · "chaos patch"  · "no stable release"
-  Arsenal     → "almost FC"  · "beta champions"  · "April crash"
-  Tottenham   → "no-trophy mode"  · "empty cabinet.exe"  · "bottle.exe"
-  Liverpool   → "pressing.exe stuck"  · "VAR dependency"  · "legacy cache"
-  Man City    → "financial plugin"  · "115 charges edition"
-  Barcelona   → "economic levers"  · "debt mode"  · "ghost payroll"
-  Real Madrid → "UCL script"  · "plot armor"  · "final boss mode"
-
-  Accept examples:
-    "Arsenal running April_crash.exe again 💀"
-    "Chelsea still in billion-dollar beta – no stable release detected 😂"
-    "United nostalgia build loading… 404 trophies not found 🤦"
-
-═══ BANNED OUTPUT – regenerate immediately if any of these appear ═══
-  ✗ "great performance tonight"  ·  "stats are impressive"  ·  "team is dominating"
-  ✗ "Stats are crazy this season" or any neutral stats observation
-  ✗ "Impressive performance tonight" or any generic praise
-  ✗ "Both teams played well" – neutral = auto-rejected
-  ✗ Any sentence a sports journalist could write without embarrassment
-  ✗ More than ONE sentence (one punchy line only)
-  ✗ Hashtags (#) or @mentions
-
-═══ ALLOWED TECH VOCABULARY ═══
-  Lag · Timeout · Bug · 404 · Patch · Deployment failed · Memory leak ·
-  Server crash · Firewall breach · Cache clear · Kernel panic · Null pointer ·
-  CPU overload · Rollback · Hotfix · Debug mode · Ping spike ·
-  سيرفر · لاق · باق · تايم أوت · كاش
-
-═══ SELF-CHECK before outputting (regenerate if ANY fails) ═══
-  1. Language matches the target tweet
-  2. PART 1 (target/jab) is present
-  3. PART 2 (tech metaphor keyword) is present
-  4. PART 3 (punchline/meme ending) lands the joke
-  5. For English replies: ≥1 club banter token is present (see ENGLISH BANTER TOKENS above)
-  6. ZERO journalist phrasing or neutral analysis
-  7. Content is safe and clean
-  8. Single punchy line ≤240 characters
-"""
-
-# ── GEMINI CONSTITUTION (90/10 ratio – Saudi طقطقة dominant) ─────────────────
-# Used ONLY when GEN_ENGINE=gemini. Tuned to Gemini's instruction-following style.
+# ── GEMINI CONSTITUTION (BugKSA identity – non-negotiable) ───────────────────
 
 GEMINI_CONSTITUTION = """\
 أنت @BugKSA – حساب طقطقة كروية سعودية. لست صحفياً رياضياً. لست بوت أخبار.
@@ -692,50 +620,6 @@ def _quality_check_candidate(reply: str, lang_hint: str, attempt: int,
     return metaphor or ""   # empty string = no metaphor found (still a pass)
 
 
-def _generate_openai(tweet_text: str, lang_hint: str = "en",
-                     state: dict | None = None) -> str:
-    """Generate reply via OpenAI gpt-4o-mini. Returns '' if all attempts fail (caller skips tweet)."""
-    global _openai_client
-    if _openai_client is None:
-        key = (os.getenv("OPENAI_API_KEY") or "").strip()
-        if not key:
-            raise RuntimeError("GEN_ENGINE=openai requires OPENAI_API_KEY")
-        _openai_client = OpenAI(api_key=key)
-        log.info("Engine: OpenAI (%s) – client ready", OPENAI_MODEL)
-
-    _, user_prompt = _build_user_prompt(tweet_text, lang_hint)
-    recent_metaphors: list[str] = (state or {}).get("recent_metaphors", [])
-
-    for attempt in range(3):
-        try:
-            resp = _openai_client.chat.completions.create(
-                model=OPENAI_MODEL,
-                messages=[
-                    {"role": "system", "content": SYSTEM_CONSTITUTION},
-                    {"role": "user",   "content": user_prompt},
-                ],
-                temperature=min(0.80 + attempt * 0.05, 1.0),
-                max_completion_tokens=120,
-            )
-            text  = (resp.choices[0].message.content or "").strip()
-            reply = " ".join(text.splitlines()).strip()[:240]
-
-            metaphor = _quality_check_candidate(reply, lang_hint, attempt, recent_metaphors, "OpenAI")
-            if metaphor is None:
-                continue
-
-            if state is not None and metaphor:
-                state.setdefault("recent_metaphors", []).append(metaphor)
-                state["recent_metaphors"] = state["recent_metaphors"][-20:]
-            return reply
-
-        except Exception as e:
-            log.warning(f"[OpenAI] engine error (attempt {attempt + 1}): {e}")
-
-    log.warning("[OpenAI] All 3 attempts failed – tweet will be skipped")
-    return ""
-
-
 def _generate_gemini(tweet_text: str, lang_hint: str = "en",
                      state: dict | None = None) -> str:
     """Generate reply via Gemini gemini-1.5-flash.
@@ -794,15 +678,8 @@ def _generate_gemini(tweet_text: str, lang_hint: str = "en",
 
 def generate_reply(tweet_text: str, lang_hint: str = "en",
                    state: dict | None = None) -> str:
-    """Route to the active engine (GEN_ENGINE). Returns '' on failure – caller skips tweet.
-
-    No automatic fallback between engines by design (Full Toggle):
-      GEN_ENGINE=openai → OpenAI only
-      GEN_ENGINE=gemini → Gemini only
-    """
-    if GEN_ENGINE == "gemini":
-        return _generate_gemini(tweet_text, lang_hint, state)
-    return _generate_openai(tweet_text, lang_hint, state)
+    """Generate a reply via Gemini. Returns '' on failure – caller skips tweet."""
+    return _generate_gemini(tweet_text, lang_hint, state)
 
 
 def detect_arabic(text: str) -> bool:
