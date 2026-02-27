@@ -695,14 +695,23 @@ def _generate_gemini(tweet_text: str, lang_hint: str = "en",
                 "not found" in err_str.lower() or "not supported" in err_str.lower()
             ):
                 try:
-                    available = [m.name for m in _gemini_client.models.list()]
+                    all_models = list(_gemini_client.models.list())
+                    gen_models = [
+                        m.name for m in all_models
+                        if "generateContent" in (
+                            getattr(m, "supported_actions", None)
+                            or getattr(m, "supported_generation_methods", None)
+                            or []
+                        )
+                    ]
                     log.warning(
-                        "[Gemini] 404 model=%s not found. Available (first 5): %s",
-                        _active_gemini_model, available[:5],
+                        "[Gemini] 404 model=%s not found. generateContent models (first 5): %s",
+                        _active_gemini_model, gen_models[:5],
                     )
                 except Exception:
-                    available = []
-                for fb in _GEMINI_FALLBACKS:
+                    gen_models = []
+                fallback_pool = gen_models if gen_models else _GEMINI_FALLBACKS
+                for fb in fallback_pool:
                     if fb != _active_gemini_model:
                         log.warning("[Gemini] 404 → switching active model to %s", fb)
                         _active_gemini_model = fb
@@ -783,8 +792,27 @@ def post_reply(state: dict, in_reply_to_tweet_id: int, text: str,
         log.info(f"[DRY_RUN] Would reply to {in_reply_to_tweet_id}: {text}")
         record_action(state)
         return
-    x.create_tweet(text=text, in_reply_to_tweet_id=in_reply_to_tweet_id, user_auth=True)
-    record_action(state)
+    try:
+        x.create_tweet(text=text, in_reply_to_tweet_id=in_reply_to_tweet_id, user_auth=True)
+        log.info("posted=reply tweet_id=%s", in_reply_to_tweet_id)
+        record_action(state)
+    except tweepy.Forbidden as e:
+        err_str = str(e).lower()
+        resp_body = ""
+        try:
+            resp_body = e.response.text.lower()
+        except AttributeError:
+            pass
+        api_msgs = " ".join(str(m) for m in getattr(e, "api_messages", [])).lower()
+        full_err = err_str + " " + resp_body + " " + api_msgs
+        if ("not allowed" in full_err or "conversation" in full_err
+                or "mentioned" in full_err or "349" in full_err):
+            log.warning("fallback=quote_403 tweet_id=%s", in_reply_to_tweet_id)
+            x.create_tweet(text=text, quote_tweet_id=in_reply_to_tweet_id, user_auth=True)
+            log.info("posted=quote tweet_id=%s", in_reply_to_tweet_id)
+            record_action(state)
+        else:
+            raise
 
 
 def post_tweet(state: dict, text: str, lang_hint: str = "ar") -> None:
@@ -1052,52 +1080,7 @@ def monitor_mentions_and_snipes() -> None:
                         _snipe_engage(tw.id, my_id, liked_set, state)
 
                         log.info(f"Snipe @{uname}: replying → {reply}")
-                        try:
-                            post_reply(state, tw.id, reply, lang_hint)
-                        except Exception as reply_err:
-                            err_str = str(reply_err).lower()
-                            # X API v2 may return error under 'detail' key inside
-                            # errors[] which tweepy doesn't add to str() – check
-                            # the raw response body and api_messages as well.
-                            resp_body = ""
-                            try:
-                                resp_body = reply_err.response.text.lower()
-                            except AttributeError:
-                                pass
-                            api_msgs = " ".join(
-                                str(m) for m in getattr(reply_err, "api_messages", [])
-                            ).lower()
-                            full_err = err_str + " " + resp_body + " " + api_msgs
-                            if ("not allowed" in full_err or "conversation" in full_err
-                                    or "mentioned" in full_err or "349" in full_err):
-                                log.warning(
-                                    "Snipe @%s %s: error=403 → fallback=quote",
-                                    uname, tid,
-                                )
-                                try:
-                                    if DRY_RUN:
-                                        log.info("[DRY_RUN] Would quote-tweet %s: %r", tid, reply)
-                                        record_action(state)
-                                    else:
-                                        x.create_tweet(
-                                            text=reply,
-                                            quote_tweet_id=tw.id,
-                                            user_auth=True,
-                                        )
-                                        record_action(state)
-                                except Exception as qt_err:
-                                    log.warning(
-                                        "Snipe @%s %s: quote tweet failed: %s",
-                                        uname, tid, qt_err,
-                                    )
-                                if derby:
-                                    state["derby_burst_log"].append(now_ts())
-                                replied_set.add(tid)
-                                state["replied_tweet_ids"].append(tid)
-                                save_state(state)
-                                did_action = True
-                                continue
-                            raise
+                        post_reply(state, tw.id, reply, lang_hint)
                         replied_set.add(tid)
                         state["replied_tweet_ids"].append(tid)
                         if derby:
