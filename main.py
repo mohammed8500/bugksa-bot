@@ -40,16 +40,11 @@ def env(name: str, required: bool = True) -> str:
     return v
 
 
-GEN_ENGINE      = (os.getenv("GEN_ENGINE") or "gemini").strip().lower()  # "openai" | "gemini"
+GEN_ENGINE   = (os.getenv("GEN_ENGINE") or "gemini").strip().lower()  # "openai" | "gemini"
+OPENAI_MODEL = (os.getenv("OPENAI_MODEL") or "gpt-4o-mini").strip()
 
-if GEN_ENGINE == "gemini":
-    GEMINI_API_KEY  = env("GEMINI_API_KEY")
-    OPENAI_API_KEY  = ""
-    OPENAI_MODEL    = ""
-else:
-    OPENAI_API_KEY  = env("OPENAI_API_KEY")
-    OPENAI_MODEL    = (os.getenv("OPENAI_MODEL") or "gpt-4o-mini").strip()
-    GEMINI_API_KEY  = ""
+if GEN_ENGINE not in ("openai", "gemini"):
+    raise RuntimeError(f"Invalid GEN_ENGINE: {GEN_ENGINE!r} – must be 'openai' or 'gemini'")
 
 X_API_KEY       = env("X_API_KEY")
 X_API_SECRET    = env("X_API_SECRET")
@@ -482,20 +477,12 @@ def governor_allows(state: dict, derby: bool = False) -> tuple[bool, str]:
     return True, "ok"
 
 
-# ── AI client – initialised once based on GEN_ENGINE ─────────────────────────
+# ── AI clients – lazy-initialised on first call inside generate functions ─────
 
-if GEN_ENGINE == "gemini":
-    genai.configure(api_key=GEMINI_API_KEY)
-    _gemini_client = genai.GenerativeModel(
-        "gemini-1.5-flash",
-        system_instruction=GEMINI_CONSTITUTION,
-    )
-    ai = None
-    log.info(f"Engine: Gemini (gemini-1.5-flash)")
-else:
-    ai = OpenAI(api_key=OPENAI_API_KEY)
-    _gemini_client = None
-    log.info(f"Engine: OpenAI ({OPENAI_MODEL})")
+_openai_client: "OpenAI | None" = None
+_gemini_client: "genai.GenerativeModel | None" = None
+
+log.info(f"Engine: {GEN_ENGINE.upper()} (lazy init)")
 
 # ── Fallback reply (used when LLM API fails completely) ───────────────────────
 # Passes quality_ok() for both "ar" and "en": tech(سيرفر) + sarcasm(😂 !) = 2/3
@@ -708,12 +695,20 @@ def _quality_check_candidate(reply: str, lang_hint: str, attempt: int,
 def _generate_openai(tweet_text: str, lang_hint: str = "en",
                      state: dict | None = None) -> str:
     """Generate reply via OpenAI gpt-4o-mini. Returns '' if all attempts fail (caller skips tweet)."""
+    global _openai_client
+    if _openai_client is None:
+        key = (os.getenv("OPENAI_API_KEY") or "").strip()
+        if not key:
+            raise RuntimeError("GEN_ENGINE=openai requires OPENAI_API_KEY")
+        _openai_client = OpenAI(api_key=key)
+        log.info("Engine: OpenAI (%s) – client ready", OPENAI_MODEL)
+
     _, user_prompt = _build_user_prompt(tweet_text, lang_hint)
     recent_metaphors: list[str] = (state or {}).get("recent_metaphors", [])
 
     for attempt in range(3):
         try:
-            resp = ai.chat.completions.create(
+            resp = _openai_client.chat.completions.create(
                 model=OPENAI_MODEL,
                 messages=[
                     {"role": "system", "content": SYSTEM_CONSTITUTION},
@@ -748,6 +743,18 @@ def _generate_gemini(tweet_text: str, lang_hint: str = "en",
     Returns FALLBACK_REPLY if all API calls raise exceptions (cycle never stops).
     Returns '' if LLM responded but quality gate kept rejecting (caller skips tweet).
     """
+    global _gemini_client
+    if _gemini_client is None:
+        key = (os.getenv("GEMINI_API_KEY") or "").strip()
+        if not key:
+            raise RuntimeError("GEN_ENGINE=gemini requires GEMINI_API_KEY")
+        genai.configure(api_key=key)
+        _gemini_client = genai.GenerativeModel(
+            "gemini-1.5-flash",
+            system_instruction=GEMINI_CONSTITUTION,
+        )
+        log.info("Engine: Gemini (gemini-1.5-flash) – client ready")
+
     _, user_prompt = _build_user_prompt(tweet_text, lang_hint)
     recent_metaphors: list[str] = (state or {}).get("recent_metaphors", [])
     api_error_count = 0
