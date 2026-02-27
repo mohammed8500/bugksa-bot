@@ -634,10 +634,10 @@ def _generate_gemini(tweet_text: str, lang_hint: str = "en",
             raise RuntimeError("GEN_ENGINE=gemini requires GEMINI_API_KEY")
         genai.configure(api_key=key)
         _gemini_client = genai.GenerativeModel(
-            "gemini-1.5-flash",
+            "gemini-2.0-flash",
             system_instruction=GEMINI_CONSTITUTION,
         )
-        log.info("Engine: Gemini (gemini-1.5-flash) – client ready")
+        log.info("Engine: Gemini (gemini-2.0-flash) – client ready")
 
     _, user_prompt = _build_user_prompt(tweet_text, lang_hint)
     recent_metaphors: list[str] = (state or {}).get("recent_metaphors", [])
