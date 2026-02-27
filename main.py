@@ -484,9 +484,22 @@ _gemini_client: "genai.Client | None" = None
 
 log.info("Engine: GEMINI (lazy init)")
 
-# ── Fallback reply (used when LLM API fails completely) ───────────────────────
-# Passes quality_ok() for both "ar" and "en": tech(سيرفر) + sarcasm(😂 !) = 2/3
-FALLBACK_REPLY = "السيرفر يهنق والمباراة ما وقفت! 😂 هذا الدوري مو رحيم"
+# ── Fallback replies (used when LLM API fails completely) ─────────────────────
+# All pass quality_ok(): tech + sarcasm = 2/3. Multiple entries prevent
+# Twitter's duplicate-content 403 when Gemini hits rate limits.
+_FALLBACK_REPLIES: list[str] = [
+    "السيرفر يهنق والمباراة ما وقفت! 😂 هذا الدوري مو رحيم",
+    "لاق ما وقف والضربة دخلت 😂 هذا مو دفاع، هذا timeout",
+    "الكرة في الشبكة والـ bug بعد شايل! 😭",
+    "تايم أوت من الدفاع وما رجعوا 🤦 والسيرفر مصدق",
+    "error 404: الدفاع غير موجود 💀 هذا موسم وايد قاسي",
+    "الـ server crash والمباراة ما توقف 😂 هذا الكورة",
+]
+FALLBACK_REPLY = _FALLBACK_REPLIES[0]  # kept for backward compat
+
+
+def _pick_fallback() -> str:
+    return random.choice(_FALLBACK_REPLIES)
 
 # ── GEMINI CONSTITUTION (BugKSA identity – non-negotiable) ───────────────────
 
@@ -677,7 +690,7 @@ def _generate_gemini(tweet_text: str, lang_hint: str = "en",
 
     if api_error_count == 3:
         log.warning("[Gemini] All 3 API calls failed – using text fallback, cycle continues")
-        return FALLBACK_REPLY
+        return _pick_fallback()
 
     log.warning("[Gemini] All 3 attempts failed quality gate – tweet will be skipped")
     return ""
@@ -903,7 +916,26 @@ def monitor_mentions_and_snipes() -> None:
                         continue
 
                     log.info(f"Mention {tid}: replying → {reply}")
-                    post_reply(state, tw.id, reply, lang_hint)
+                    try:
+                        post_reply(state, tw.id, reply, lang_hint)
+                    except Exception as mention_err:
+                        m_str = str(mention_err).lower()
+                        m_body = ""
+                        try:
+                            m_body = mention_err.response.text.lower()
+                        except AttributeError:
+                            pass
+                        m_msgs = " ".join(
+                            str(m) for m in getattr(mention_err, "api_messages", [])
+                        ).lower()
+                        full_m = m_str + " " + m_body + " " + m_msgs
+                        if "duplicate" in full_m or "187" in full_m:
+                            log.warning("Mention %s: duplicate content – skip", tid)
+                            replied_set.add(tid)
+                            state["replied_tweet_ids"].append(tid)
+                            save_state(state)
+                            continue
+                        raise
                     replied_set.add(tid)
                     state["replied_tweet_ids"].append(tid)
                     if derby:
