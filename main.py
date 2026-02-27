@@ -961,6 +961,7 @@ def monitor_mentions_and_snipes() -> None:
                         since_id=last_seen,
                         max_results=5,
                         user_auth=True,
+                        tweet_fields=["reply_settings"],
                     )
                     if not tweets or not tweets.data:
                         continue
@@ -978,6 +979,10 @@ def monitor_mentions_and_snipes() -> None:
                             replied_set.add(tid)
                             state["replied_tweet_ids"].append(tid)
                             save_state(state)
+                            continue
+                        rs = getattr(tw, "reply_settings", "everyone")
+                        if rs != "everyone":
+                            log.info("Skip %s – reply_settings=%s", tid, rs)
                             continue
 
                         # Humanize: clubs skip 40 %, personality accounts skip 70 %
@@ -1031,9 +1036,14 @@ def monitor_mentions_and_snipes() -> None:
                             if ("not allowed" in full_err or "conversation" in full_err
                                     or "mentioned" in full_err or "349" in full_err):
                                 log.warning(
-                                    "Snipe @%s %s: reply blocked by conversation control",
+                                    "Snipe @%s %s: reply blocked – trying quote tweet",
                                     uname, tid,
                                 )
+                                tweet_url = f"https://x.com/i/web/status/{tid}"
+                                try:
+                                    post_tweet(state, f"{reply}\n{tweet_url}", lang_hint)
+                                except Exception as qt_err:
+                                    log.warning("Quote tweet also failed: %s", qt_err)
                                 replied_set.add(tid)
                                 state["replied_tweet_ids"].append(tid)
                                 save_state(state)
