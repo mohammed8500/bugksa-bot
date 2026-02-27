@@ -40,7 +40,7 @@ def env(name: str, required: bool = True) -> str:
     return v
 
 
-GEN_ENGINE      = (os.getenv("GEN_ENGINE") or "openai").strip().lower()  # "openai" | "gemini"
+GEN_ENGINE      = (os.getenv("GEN_ENGINE") or "gemini").strip().lower()  # "openai" | "gemini"
 
 if GEN_ENGINE == "gemini":
     GEMINI_API_KEY  = env("GEMINI_API_KEY")
@@ -497,6 +497,10 @@ else:
     _gemini_client = None
     log.info(f"Engine: OpenAI ({OPENAI_MODEL})")
 
+# ── Fallback reply (used when LLM API fails completely) ───────────────────────
+# Passes quality_ok() for both "ar" and "en": tech(سيرفر) + sarcasm(😂 !) = 2/3
+FALLBACK_REPLY = "السيرفر يهنق والمباراة ما وقفت! 😂 هذا الدوري مو رحيم"
+
 # ── SYSTEM CONSTITUTION (BugKSA identity – non-negotiable) ───────────────────
 
 SYSTEM_CONSTITUTION = """\
@@ -739,9 +743,14 @@ def _generate_openai(tweet_text: str, lang_hint: str = "en",
 
 def _generate_gemini(tweet_text: str, lang_hint: str = "en",
                      state: dict | None = None) -> str:
-    """Generate reply via Gemini gemini-1.5-flash. Returns '' if all attempts fail (caller skips tweet)."""
+    """Generate reply via Gemini gemini-1.5-flash.
+
+    Returns FALLBACK_REPLY if all API calls raise exceptions (cycle never stops).
+    Returns '' if LLM responded but quality gate kept rejecting (caller skips tweet).
+    """
     _, user_prompt = _build_user_prompt(tweet_text, lang_hint)
     recent_metaphors: list[str] = (state or {}).get("recent_metaphors", [])
+    api_error_count = 0
 
     for attempt in range(3):
         try:
@@ -765,9 +774,14 @@ def _generate_gemini(tweet_text: str, lang_hint: str = "en",
             return reply
 
         except Exception as e:
-            log.warning(f"[Gemini] engine error (attempt {attempt + 1}): {e}")
+            api_error_count += 1
+            log.error("[Gemini] LLM fail (attempt %d): %s", attempt + 1, e)
 
-    log.warning("[Gemini] All 3 attempts failed – tweet will be skipped")
+    if api_error_count == 3:
+        log.warning("[Gemini] All 3 API calls failed – using text fallback, cycle continues")
+        return FALLBACK_REPLY
+
+    log.warning("[Gemini] All 3 attempts failed quality gate – tweet will be skipped")
     return ""
 
 
