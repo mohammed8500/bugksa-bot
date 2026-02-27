@@ -639,23 +639,25 @@ def _quality_check_candidate(reply: str, lang_hint: str, attempt: int,
     return metaphor or ""   # empty string = no metaphor found (still a pass)
 
 
-GEMINI_MODEL = "gemini-2.0-flash"
+GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.0-flash")
+_GEMINI_FALLBACKS = ["gemini-1.5-flash-latest", "gemini-2.0-flash", "gemini-1.5-pro"]
+_active_gemini_model: str = GEMINI_MODEL
 
 
 def _generate_gemini(tweet_text: str, lang_hint: str = "en",
                      state: dict | None = None) -> str:
-    """Generate reply via Gemini (model: GEMINI_MODEL).
+    """Generate reply via Gemini (model: _active_gemini_model).
 
     Returns FALLBACK_REPLY if all API calls raise exceptions (cycle never stops).
     Returns '' if LLM responded but quality gate kept rejecting (caller skips tweet).
     """
-    global _gemini_client
+    global _gemini_client, _active_gemini_model
     if _gemini_client is None:
         key = (os.getenv("GEMINI_API_KEY") or "").strip()
         if not key:
             raise RuntimeError("GEN_ENGINE=gemini requires GEMINI_API_KEY")
         _gemini_client = genai.Client(api_key=key)
-        log.info("Gemini model loaded: %s", GEMINI_MODEL)
+        log.info("[Gemini] client ready – active model: %s", _active_gemini_model)
 
     _, user_prompt = _build_user_prompt(tweet_text, lang_hint)
     recent_metaphors: list[str] = (state or {}).get("recent_metaphors", [])
@@ -664,7 +666,7 @@ def _generate_gemini(tweet_text: str, lang_hint: str = "en",
     for attempt in range(3):
         try:
             resp = _gemini_client.models.generate_content(
-                model=GEMINI_MODEL,
+                model=_active_gemini_model,
                 contents=user_prompt,
                 config=genai_types.GenerateContentConfig(
                     system_instruction=GEMINI_CONSTITUTION,
@@ -686,7 +688,25 @@ def _generate_gemini(tweet_text: str, lang_hint: str = "en",
 
         except Exception as e:
             api_error_count += 1
+            err_str = str(e)
             log.error("[Gemini] LLM fail (attempt %d): %s", attempt + 1, e)
+            # 404 model not found – list available and switch to first working fallback
+            if "404" in err_str and (
+                "not found" in err_str.lower() or "not supported" in err_str.lower()
+            ):
+                try:
+                    available = [m.name for m in _gemini_client.models.list()]
+                    log.warning(
+                        "[Gemini] 404 model=%s not found. Available (first 5): %s",
+                        _active_gemini_model, available[:5],
+                    )
+                except Exception:
+                    available = []
+                for fb in _GEMINI_FALLBACKS:
+                    if fb != _active_gemini_model:
+                        log.warning("[Gemini] 404 → switching active model to %s", fb)
+                        _active_gemini_model = fb
+                        break
 
     if api_error_count == 3:
         log.warning("[Gemini] All 3 API calls failed – using text fallback, cycle continues")
@@ -961,7 +981,14 @@ def monitor_mentions_and_snipes() -> None:
                         since_id=last_seen,
                         max_results=5,
                         user_auth=True,
-                        tweet_fields=["reply_settings"],
+                        exclude=["replies", "retweets"],
+                        tweet_fields=[
+                            "reply_settings",
+                            "referenced_tweets",
+                            "lang",
+                            "author_id",
+                            "conversation_id",
+                        ],
                     )
                     if not tweets or not tweets.data:
                         continue
@@ -982,13 +1009,21 @@ def monitor_mentions_and_snipes() -> None:
                             continue
                         rs = getattr(tw, "reply_settings", "everyone")
                         if rs != "everyone":
-                            log.info("Skip %s – reply_settings=%s", tid, rs)
+                            log.info("Snipe @%s %s: skip=reply_settings val=%s", uname, tid, rs)
+                            continue
+
+                        ref_types = {
+                            r.get("type") if isinstance(r, dict) else getattr(r, "type", "")
+                            for r in (getattr(tw, "referenced_tweets", None) or [])
+                        }
+                        if ref_types & {"replied_to", "retweeted"}:
+                            log.info("Snipe @%s %s: skip=non_original ref=%s", uname, tid, ref_types)
                             continue
 
                         # Humanize: clubs skip 40 %, personality accounts skip 70 %
                         skip_rate = PERSONALITY_SKIP_RATE if meta.get("origin") == "personality" else HUMANIZE_SKIP_RATE
                         if random.random() < skip_rate:
-                            log.info(f"Snipe @{uname} {tid}: humanized skip")
+                            log.info("Snipe @%s %s: skip=humanized", uname, tid)
                             continue
 
                         derby = is_derby(tw.text)
@@ -1036,17 +1071,31 @@ def monitor_mentions_and_snipes() -> None:
                             if ("not allowed" in full_err or "conversation" in full_err
                                     or "mentioned" in full_err or "349" in full_err):
                                 log.warning(
-                                    "Snipe @%s %s: reply blocked – trying quote tweet",
+                                    "Snipe @%s %s: error=403 → fallback=quote",
                                     uname, tid,
                                 )
-                                tweet_url = f"https://x.com/i/web/status/{tid}"
                                 try:
-                                    post_tweet(state, f"{reply}\n{tweet_url}", lang_hint)
+                                    if DRY_RUN:
+                                        log.info("[DRY_RUN] Would quote-tweet %s: %r", tid, reply)
+                                        record_action(state)
+                                    else:
+                                        x.create_tweet(
+                                            text=reply,
+                                            quote_tweet_id=tw.id,
+                                            user_auth=True,
+                                        )
+                                        record_action(state)
                                 except Exception as qt_err:
-                                    log.warning("Quote tweet also failed: %s", qt_err)
+                                    log.warning(
+                                        "Snipe @%s %s: quote tweet failed: %s",
+                                        uname, tid, qt_err,
+                                    )
+                                if derby:
+                                    state["derby_burst_log"].append(now_ts())
                                 replied_set.add(tid)
                                 state["replied_tweet_ids"].append(tid)
                                 save_state(state)
+                                did_action = True
                                 continue
                             raise
                         replied_set.add(tid)
