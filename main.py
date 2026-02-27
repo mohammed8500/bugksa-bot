@@ -624,9 +624,12 @@ def _quality_check_candidate(reply: str, lang_hint: str, attempt: int,
     return metaphor or ""   # empty string = no metaphor found (still a pass)
 
 
+GEMINI_MODEL = "gemini-2.0-flash"
+
+
 def _generate_gemini(tweet_text: str, lang_hint: str = "en",
                      state: dict | None = None) -> str:
-    """Generate reply via Gemini gemini-1.5-flash.
+    """Generate reply via Gemini (model: GEMINI_MODEL).
 
     Returns FALLBACK_REPLY if all API calls raise exceptions (cycle never stops).
     Returns '' if LLM responded but quality gate kept rejecting (caller skips tweet).
@@ -637,7 +640,7 @@ def _generate_gemini(tweet_text: str, lang_hint: str = "en",
         if not key:
             raise RuntimeError("GEN_ENGINE=gemini requires GEMINI_API_KEY")
         _gemini_client = genai.Client(api_key=key)
-        log.info("Engine: Gemini (gemini-2.0-flash) – client ready")
+        log.info("Gemini model loaded: %s", GEMINI_MODEL)
 
     _, user_prompt = _build_user_prompt(tweet_text, lang_hint)
     recent_metaphors: list[str] = (state or {}).get("recent_metaphors", [])
@@ -646,7 +649,7 @@ def _generate_gemini(tweet_text: str, lang_hint: str = "en",
     for attempt in range(3):
         try:
             resp = _gemini_client.models.generate_content(
-                model="gemini-2.0-flash",
+                model=GEMINI_MODEL,
                 contents=user_prompt,
                 config=genai_types.GenerateContentConfig(
                     system_instruction=GEMINI_CONSTITUTION,
