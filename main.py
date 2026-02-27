@@ -18,7 +18,8 @@ import logging
 from pathlib import Path
 
 import tweepy
-import google.generativeai as genai
+from google import genai
+from google.genai import types as genai_types
 
 # ── Logging ───────────────────────────────────────────────────────────────────
 
@@ -474,7 +475,7 @@ def governor_allows(state: dict, derby: bool = False) -> tuple[bool, str]:
 
 # ── AI client – lazy-initialised on first generate call ──────────────────────
 
-_gemini_client: "genai.GenerativeModel | None" = None
+_gemini_client: "genai.Client | None" = None
 
 log.info("Engine: GEMINI (lazy init)")
 
@@ -632,11 +633,7 @@ def _generate_gemini(tweet_text: str, lang_hint: str = "en",
         key = (os.getenv("GEMINI_API_KEY") or "").strip()
         if not key:
             raise RuntimeError("GEN_ENGINE=gemini requires GEMINI_API_KEY")
-        genai.configure(api_key=key)
-        _gemini_client = genai.GenerativeModel(
-            "gemini-2.0-flash",
-            system_instruction=GEMINI_CONSTITUTION,
-        )
+        _gemini_client = genai.Client(api_key=key)
         log.info("Engine: Gemini (gemini-2.0-flash) – client ready")
 
     _, user_prompt = _build_user_prompt(tweet_text, lang_hint)
@@ -645,9 +642,11 @@ def _generate_gemini(tweet_text: str, lang_hint: str = "en",
 
     for attempt in range(3):
         try:
-            resp = _gemini_client.generate_content(
-                user_prompt,
-                generation_config=genai.types.GenerationConfig(
+            resp = _gemini_client.models.generate_content(
+                model="gemini-2.0-flash",
+                contents=user_prompt,
+                config=genai_types.GenerateContentConfig(
+                    system_instruction=GEMINI_CONSTITUTION,
                     max_output_tokens=120,
                     temperature=min(0.80 + attempt * 0.05, 1.0),
                 ),
