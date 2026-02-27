@@ -984,8 +984,20 @@ def monitor_mentions_and_snipes() -> None:
                             post_reply(state, tw.id, reply, lang_hint)
                         except Exception as reply_err:
                             err_str = str(reply_err).lower()
-                            if ("not allowed" in err_str or "conversation" in err_str
-                                    or "mentioned" in err_str):
+                            # X API v2 may return error under 'detail' key inside
+                            # errors[] which tweepy doesn't add to str() – check
+                            # the raw response body and api_messages as well.
+                            resp_body = ""
+                            try:
+                                resp_body = reply_err.response.text.lower()
+                            except AttributeError:
+                                pass
+                            api_msgs = " ".join(
+                                str(m) for m in getattr(reply_err, "api_messages", [])
+                            ).lower()
+                            full_err = err_str + " " + resp_body + " " + api_msgs
+                            if ("not allowed" in full_err or "conversation" in full_err
+                                    or "mentioned" in full_err or "349" in full_err):
                                 log.warning(
                                     "Snipe @%s %s: reply blocked by conversation control",
                                     uname, tid,
