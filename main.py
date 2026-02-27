@@ -355,6 +355,21 @@ def load_state() -> dict:
     s.setdefault("last_action_ts",    0)
     s.setdefault("derby_burst_log",   [])   # timestamps in last 30 min
     s.setdefault("next_action_after", 0.0)  # humanized gate: earliest allowed next post
+
+    # ── One-time migration: drop legacy recovery_tweets_log (old cap=3 system) ──
+    stale = s.pop("recovery_tweets_log", None)
+    if stale:
+        log.info(f"Migration: purged {len(stale)} stale recovery_tweets_log entries "
+                 f"(old RECOVERY_MAX_DAY=3 system retired)")
+        # persist immediately so the key is gone even if the process crashes later
+        try:
+            tmp = STATE_FILE.with_suffix(".tmp")
+            with tmp.open("w", encoding="utf-8") as f:
+                json.dump(s, f, ensure_ascii=False, indent=2)
+            tmp.replace(STATE_FILE)
+        except Exception as exc:
+            log.warning(f"Migration flush failed (non-fatal): {exc}")
+
     return s
 
 
