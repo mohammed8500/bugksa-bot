@@ -1,15 +1,13 @@
 """
 BugKSA – Saudi Football Banter Bot (API-Football Edition)
 ==========================================================
-Fetches live events from API-Football (results, transfers, injuries),
+Fetches live events from API-Football (fixtures & live scores),
 posts them in 80 % serious + 20 % sarcastic punchline format.
-Player-related news includes the player's photo when available.
 
 Architecture
 ------------
-  Layer 1 – Safety filter     (injuries → no punchline, ever)
-  Layer 2 – Daily cap         (≤ MAX_TWEETS_PER_DAY)
-  Layer 3 – Gemini punchline  (GEMINI_CONSTITUTION enforces identity)
+  Layer 1 – Daily cap         (≤ MAX_TWEETS_PER_DAY)
+  Layer 2 – Gemini punchline  (GEMINI_CONSTITUTION enforces identity)
 
 Environment variables
 ---------------------
@@ -94,25 +92,6 @@ GEMINI_CONSTITUTION = """
 4. الابتكار: لا تكرر نفس الذبة، ونوع في الأهداف (مدرب، لاعب، إدارة).
 5. الممنوعات: ممنوع تماماً السخرية من "الإصابات"، وممنوع تكرار الخبر أو المجاملة.
 """
-
-# ── Injury keywords – Safety Filter ──────────────────────────────────────────
-
-_INJURY_KEYWORDS = frozenset({
-    # Arabic
-    "إصابة", "إصابات", "اصابة", "مصاب", "غياب طبي", "غياب بسبب",
-    "ربط صليبي", "صليبي", "تمزق", "كسر", "جراحة", "استئصال",
-    "عيادة", "المستشفى", "الرعاية الطبية", "حادة", "غضروف",
-    # English (for mixed-language APIs)
-    "injury", "injured", "surgery", "fracture", "torn",
-    "medical", "unavailable", "out for", "ruled out",
-})
-
-
-def is_injury_news(text: str) -> bool:
-    """Return True if text mentions an injury – activates the safety filter."""
-    t = text.lower()
-    return any(kw.lower() in t for kw in _INJURY_KEYWORDS)
-
 
 # ── State management ──────────────────────────────────────────────────────────
 
@@ -372,71 +351,6 @@ def format_fixture_news(fix: dict) -> tuple[str, str | None]:
     return news, None          # no player image for match results
 
 
-# ── Fetch: transfers ──────────────────────────────────────────────────────────
-
-
-def fetch_recent_transfers(league_id: int, season: int, days: int = 3) -> list[dict]:
-    """Return transfers registered within the last *days* days."""
-    raw     = _football_get("transfers", {"league": league_id, "season": season})
-    cutoff  = datetime.now() - timedelta(days=days)
-    results = []
-    for item in raw:
-        player_name  = item.get("player", {}).get("name", "")
-        player_photo = item.get("player", {}).get("photo", "")
-        for t in item.get("transfers", []):
-            try:
-                d = datetime.strptime(t.get("date", "1970-01-01"), "%Y-%m-%d")
-            except ValueError:
-                continue
-            if d < cutoff:
-                continue
-            results.append({
-                "player":       player_name,
-                "player_photo": player_photo,
-                "from_team":    t.get("teams", {}).get("out", {}).get("name", "؟"),
-                "to_team":      t.get("teams", {}).get("in",  {}).get("name", "؟"),
-                "type":         t.get("type", "انتقال"),
-                "date":         t.get("date", ""),
-                "_key":         f"transfer_{player_name}_{t.get('date', '')}",
-            })
-    return results
-
-
-def format_transfer_news(tr: dict) -> tuple[str, str | None]:
-    """Return (news_text, player_image_url) for a transfer."""
-    news = (
-        f"📢 انتقال رسمي\n"
-        f"🔴 {tr['player']}\n"
-        f"من: {tr['from_team']} ← إلى: {tr['to_team']}\n"
-        f"النوع: {tr['type']} | {tr['date']}"
-    )
-    return news, tr.get("player_photo") or None
-
-
-# ── Fetch: injuries ───────────────────────────────────────────────────────────
-
-
-def fetch_injuries(league_id: int, season: int) -> list[dict]:
-    """Return current injury reports for the league."""
-    return _football_get("injuries", {"league": league_id, "season": season})
-
-
-def format_injury_news(inj: dict) -> tuple[str, str | None]:
-    """Return (news_text, player_image_url) for an injury report.
-
-    Safety filter guarantees the caller NEVER generates a punchline for this.
-    """
-    player = inj.get("player", {})
-    team   = inj.get("team",   {})
-    reason = inj.get("reason", "إصابة")
-    news = (
-        f"🏥 تقرير طبي\n"
-        f"{player.get('name', 'لاعب')} ({team.get('name', 'الفريق')})\n"
-        f"السبب: {reason}"
-    )
-    return news, player.get("photo") or None
-
-
 # ── Main event-processing loop ────────────────────────────────────────────────
 
 
@@ -446,7 +360,7 @@ def process_events(
     gemini: "genai.GenerativeModel",
     state:  dict,
 ) -> int:
-    """Fetch all event types and post new ones.  Returns count of tweets posted."""
+    """Fetch fixtures and post new results.  Returns count of tweets posted."""
 
     posted     = 0
     posted_ids = set(state.get("posted_event_ids", []))
@@ -462,7 +376,7 @@ def process_events(
         mid = upload_player_image(v1, img_url)
         return [mid] if mid else []
 
-    # ── 1. Match results ──────────────────────────────────────────────────────
+    # ── Match results ─────────────────────────────────────────────────────────
     log.info("Fetching fixtures …")
     for fix in fetch_recent_fixtures(SAUDI_PRO_LEAGUE_ID, CURRENT_SEASON):
         if tweets_today(state) >= MAX_TWEETS_PER_DAY:
@@ -472,58 +386,9 @@ def process_events(
             continue
 
         news, img_url  = format_fixture_news(fix)
-        punchline      = generate_punchline(gemini, news)          # always ok for results
+        punchline      = generate_punchline(gemini, news)
         tweet_text     = build_tweet_text(news, punchline)
         media_ids      = _maybe_upload_image(img_url)
-
-        if post_tweet(v2, state, tweet_text, media_ids or None):
-            _record_posted(key)
-            posted += 1
-            time.sleep(random.uniform(HUMANIZE_MIN_S, HUMANIZE_MAX_S))
-
-    # ── 2. Transfers ──────────────────────────────────────────────────────────
-    time.sleep(6)   # avoid 429: free tier = ~10 req/min → 6s gap between endpoints
-    log.info("Fetching transfers …")
-    for tr in fetch_recent_transfers(SAUDI_PRO_LEAGUE_ID, CURRENT_SEASON):
-        if tweets_today(state) >= MAX_TWEETS_PER_DAY:
-            break
-        key = tr.get("_key", "")
-        if not key or key in posted_ids:
-            continue
-
-        news, img_url  = format_transfer_news(tr)
-        punchline      = generate_punchline(gemini, news)          # transfers are never injuries
-        tweet_text     = build_tweet_text(news, punchline)
-        media_ids      = _maybe_upload_image(img_url)
-
-        if post_tweet(v2, state, tweet_text, media_ids or None):
-            _record_posted(key)
-            posted += 1
-            time.sleep(random.uniform(HUMANIZE_MIN_S, HUMANIZE_MAX_S))
-
-    # ── 3. Injuries – SAFETY FILTER: no punchline, ever ──────────────────────
-    time.sleep(6)
-    log.info("Fetching injuries …")
-    for inj in fetch_injuries(SAUDI_PRO_LEAGUE_ID, CURRENT_SEASON)[:10]:
-        if tweets_today(state) >= MAX_TWEETS_PER_DAY:
-            break
-        p_id  = inj.get("player",  {}).get("id",  "")
-        f_id  = inj.get("fixture", {}).get("id",  "")
-        key   = f"injury_{p_id}_{f_id}"
-        if not p_id or key in posted_ids:
-            continue
-
-        news, img_url  = format_injury_news(inj)
-
-        # Double-check safety filter (should always be True for /injuries endpoint)
-        if not is_injury_news(news):
-            log.warning("Injury endpoint returned non-injury text? Skipping: %r", news[:60])
-            continue
-
-        # NO punchline – post news + photo only
-        log.info("Injury news (safety filter active): posting without punchline")
-        tweet_text = build_tweet_text(news, "")          # punchline=""
-        media_ids  = _maybe_upload_image(img_url)
 
         if post_tweet(v2, state, tweet_text, media_ids or None):
             _record_posted(key)
