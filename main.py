@@ -257,11 +257,30 @@ def _football_get(endpoint: str, params: dict) -> list:
 
 
 def fetch_live_fixtures(league_id: int) -> list[dict]:
-    """Return currently live fixtures for the league."""
+    """Return currently live fixtures for the league.
+
+    Tries ?live=all first (requires higher API tier); falls back to querying
+    today's fixtures with in-progress statuses (1H, HT, 2H, ET, P) which
+    works on all subscription tiers.
+    """
+    today = datetime.now().strftime("%Y-%m-%d")
+
+    # Primary: live endpoint
+    results = _football_get("fixtures", {
+        "league": league_id,
+        "season": CURRENT_SEASON,
+        "live":   "all",
+    })
+    if results:
+        return results
+
+    # Fallback: today's fixtures filtered to in-progress statuses
+    log.info("live=all returned nothing – trying in-progress status fallback …")
     return _football_get("fixtures", {
-        "league":  league_id,
-        "season":  CURRENT_SEASON,
-        "live":    "all",
+        "league": league_id,
+        "season": CURRENT_SEASON,
+        "date":   today,
+        "status": "1H-HT-2H-ET-P",
     })
 
 
