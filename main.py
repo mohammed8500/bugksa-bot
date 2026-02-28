@@ -24,7 +24,6 @@ import json
 import time
 import random
 import logging
-import tempfile
 from pathlib import Path
 from datetime import datetime, timedelta
 
@@ -124,24 +123,24 @@ def tweets_today(state: dict) -> int:
     return sum(1 for t in state.get("tweets_today", []) if t > cutoff)
 
 
-# ── Twitter clients ───────────────────────────────────────────────────────────
+# ── Twitter client (v2 only) ──────────────────────────────────────────────────
 
 
-def make_twitter_clients() -> tuple["tweepy.Client", "tweepy.API"]:
-    """Return (v2 Client for posting, v1.1 API for media upload)."""
-    v2 = tweepy.Client(
+def make_twitter_v2() -> "tweepy.Client":
+    """Return a v2 Client for posting tweets.
+
+    wait_on_rate_limit=False: disables tweepy's background polling of Twitter
+    rate-limit endpoints, which consumes API credits even when no tweet is posted.
+    We handle 429s manually via the football API retry logic; Twitter 429s are
+    caught in post_tweet() and logged without retrying.
+    """
+    return tweepy.Client(
         consumer_key=X_API_KEY,
         consumer_secret=X_API_SECRET,
         access_token=X_ACCESS_TOKEN,
         access_token_secret=X_ACCESS_SECRET,
-        wait_on_rate_limit=True,
+        wait_on_rate_limit=False,
     )
-    auth = tweepy.OAuth1UserHandler(
-        X_API_KEY, X_API_SECRET,
-        X_ACCESS_TOKEN, X_ACCESS_SECRET,
-    )
-    v1 = tweepy.API(auth, wait_on_rate_limit=True)
-    return v2, v1
 
 
 # ── Gemini client ─────────────────────────────────────────────────────────────
@@ -182,40 +181,6 @@ def generate_punchline(client: "genai.Client", news_text: str) -> str:
         return ""
 
 
-# ── Image upload ──────────────────────────────────────────────────────────────
-
-
-def upload_player_image(v1: "tweepy.API", image_url: str) -> int | None:
-    """Download player image from *image_url* and upload to Twitter v1.1.
-
-    Returns media_id (int) on success, None on any failure.
-    The temp file is always deleted after upload.
-    """
-    if not image_url:
-        return None
-    try:
-        resp = requests.get(image_url, timeout=10)
-        resp.raise_for_status()
-        # Determine extension from Content-Type
-        ct = resp.headers.get("Content-Type", "")
-        ext = ".png" if "png" in ct else ".gif" if "gif" in ct else ".jpg"
-        with tempfile.NamedTemporaryFile(suffix=ext, delete=False) as tmp:
-            tmp.write(resp.content)
-            tmp_path = tmp.name
-        try:
-            media = v1.media_upload(tmp_path)
-            log.info("Image uploaded → media_id=%s", media.media_id)
-            return media.media_id
-        finally:
-            try:
-                os.unlink(tmp_path)
-            except OSError:
-                pass
-    except Exception as e:
-        log.warning("Image upload failed (%s): %s", image_url[:60], e)
-        return None
-
-
 # ── Tweet composition: 80 % news + 20 % punchline ────────────────────────────
 
 
@@ -235,15 +200,12 @@ def build_tweet_text(news: str, punchline: str) -> str:
 # ── Post one tweet ────────────────────────────────────────────────────────────
 
 
-def post_tweet(
-    v2: "tweepy.Client",
-    state: dict,
-    text: str,
-    media_ids: list[int] | None = None,
-) -> bool:
-    """Post *text* (with optional *media_ids*) using the v2 Client.
+def post_tweet(v2: "tweepy.Client", state: dict, text: str) -> bool:
+    """Post *text* using the v2 Client.
 
     Respects the daily cap and DRY_RUN flag.
+    This is the ONLY function that contacts Twitter – called only when a new
+    FT fixture is confirmed by the football API (Silent Mode gate).
     Returns True on success (or dry-run), False otherwise.
     """
     count = tweets_today(state)
@@ -252,17 +214,13 @@ def post_tweet(
         return False
 
     if DRY_RUN:
-        log.info("[DRY_RUN] Would tweet (%d chars) | media=%s | %r",
-                 len(text), media_ids, text[:80])
+        log.info("[DRY_RUN] Would tweet (%d chars): %r", len(text), text[:80])
         state.setdefault("tweets_today", []).append(time.time())
         save_state(state)
         return True
 
     try:
-        kwargs: dict = {"text": text, "user_auth": True}
-        if media_ids:
-            kwargs["media_ids"] = media_ids
-        v2.create_tweet(**kwargs)
+        v2.create_tweet(text=text, user_auth=True)
         state.setdefault("tweets_today", []).append(time.time())
         save_state(state)
         remaining = MAX_TWEETS_PER_DAY - tweets_today(state)
@@ -356,42 +314,49 @@ def format_fixture_news(fix: dict) -> tuple[str, str | None]:
 
 def process_events(
     v2:     "tweepy.Client",
-    v1:     "tweepy.API",
-    gemini: "genai.GenerativeModel",
+    gemini: "genai.Client",
     state:  dict,
 ) -> int:
-    """Fetch fixtures and post new results.  Returns count of tweets posted."""
+    """Fetch fixtures and post new FT results.
 
-    posted     = 0
+    Silent Mode: Twitter (v2.create_tweet) is contacted ONLY when at least one
+    new finished match is found.  API-Football polling is free and happens every
+    cycle; Twitter is never contacted otherwise.
+    """
     posted_ids = set(state.get("posted_event_ids", []))
 
-    def _record_posted(key: str) -> None:
-        posted_ids.add(key)
-        state.setdefault("posted_event_ids", []).append(key)
-        save_state(state)
-
-    def _maybe_upload_image(img_url: str | None) -> list[int]:
-        if not img_url:
-            return []
-        mid = upload_player_image(v1, img_url)
-        return [mid] if mid else []
-
-    # ── Match results ─────────────────────────────────────────────────────────
+    # ── Step 1: poll API-Football (zero Twitter contact) ──────────────────────
     log.info("Fetching fixtures …")
-    for fix in fetch_recent_fixtures(SAUDI_PRO_LEAGUE_ID, CURRENT_SEASON):
-        if tweets_today(state) >= MAX_TWEETS_PER_DAY:
-            break
+    raw_fixtures = fetch_recent_fixtures(SAUDI_PRO_LEAGUE_ID, CURRENT_SEASON)
+
+    new_fixtures: list[tuple[str, dict]] = []
+    for fix in raw_fixtures:
         key = f"fixture_{fix.get('fixture', {}).get('id', '')}"
-        if not key or key in posted_ids:
-            continue
+        if key and key not in posted_ids:
+            new_fixtures.append((key, fix))
 
-        news, img_url  = format_fixture_news(fix)
-        punchline      = generate_punchline(gemini, news)
-        tweet_text     = build_tweet_text(news, punchline)
-        media_ids      = _maybe_upload_image(img_url)
+    # ── Silent gate: nothing new → Twitter never touched ──────────────────────
+    if not new_fixtures:
+        log.info("Silent – no new FT fixtures found, Twitter not contacted")
+        return 0
 
-        if post_tweet(v2, state, tweet_text, media_ids or None):
-            _record_posted(key)
+    log.info("%d new FT fixture(s) queued for posting", len(new_fixtures))
+
+    # ── Step 2: only now do we interact with Twitter ───────────────────────────
+    posted = 0
+    for key, fix in new_fixtures:
+        if tweets_today(state) >= MAX_TWEETS_PER_DAY:
+            log.warning("Daily cap reached – stopping early")
+            break
+
+        news, _    = format_fixture_news(fix)
+        punchline  = generate_punchline(gemini, news)
+        tweet_text = build_tweet_text(news, punchline)
+
+        if post_tweet(v2, state, tweet_text):
+            posted_ids.add(key)
+            state.setdefault("posted_event_ids", []).append(key)
+            save_state(state)
             posted += 1
             time.sleep(random.uniform(HUMANIZE_MIN_S, HUMANIZE_MAX_S))
 
@@ -409,16 +374,20 @@ def main() -> None:
     )
     log.info("=" * 60)
 
-    v2, v1   = make_twitter_clients()
-    gemini   = make_gemini_client()
-    state    = load_state()
+    v2     = make_twitter_v2()
+    gemini = make_gemini_client()
+    state  = load_state()
+
+    if not state.get("posted_event_ids"):
+        log.warning("State is empty – this may be a fresh start or lost state file. "
+                    "Old fixtures from the last 2 days will be treated as new.")
 
     cycle = 0
     while True:
         cycle += 1
         log.info("── Cycle %d ── tweets_today=%d/%d", cycle, tweets_today(state), MAX_TWEETS_PER_DAY)
         try:
-            n = process_events(v2, v1, gemini, state)
+            n = process_events(v2, gemini, state)
             log.info("Cycle %d complete: posted %d tweet(s)", cycle, n)
         except Exception as e:
             log.error("Cycle %d unhandled error: %s", cycle, e)
