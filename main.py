@@ -78,9 +78,9 @@ POLL_INTERVAL_S    = 15 * 60   # 15 minutes between cycles
 HUMANIZE_MIN_S     = 30        # minimum sleep between posts within a cycle
 HUMANIZE_MAX_S     = 90        # maximum sleep between posts within a cycle
 
-# API-Football league / season
-SAUDI_PRO_LEAGUE_ID = 307
-CURRENT_SEASON      = 2024     # update each season
+# API-Football league / season (override via env if free-tier restricts league 307)
+SAUDI_PRO_LEAGUE_ID = int(os.getenv("FOOTBALL_LEAGUE_ID", "307"))
+CURRENT_SEASON      = int(os.getenv("FOOTBALL_SEASON",    "2024"))
 
 # ── Gemini Constitution (system prompt – used verbatim) ───────────────────────
 
@@ -323,7 +323,15 @@ def _football_get(endpoint: str, params: dict) -> list:
             r.raise_for_status()
             return r.json().get("response", [])
         except requests.HTTPError as e:
-            log.error("[API-Football] HTTP error %s %s: %s", endpoint, params, e)
+            if r.status_code == 403:
+                log.warning(
+                    "[API-Football] 403 Forbidden on /%s – "
+                    "this endpoint may require a paid RapidAPI plan. "
+                    "Set FOOTBALL_LEAGUE_ID to a free-tier league (e.g. 39=Premier League).",
+                    endpoint,
+                )
+            else:
+                log.error("[API-Football] HTTP error %s: %s", endpoint, e)
             return []
         except Exception as e:
             log.error("[API-Football] %s %s: %s", endpoint, params, e)
@@ -477,6 +485,7 @@ def process_events(
             time.sleep(random.uniform(HUMANIZE_MIN_S, HUMANIZE_MAX_S))
 
     # ── 2. Transfers ──────────────────────────────────────────────────────────
+    time.sleep(6)   # avoid 429: free tier = ~10 req/min → 6s gap between endpoints
     log.info("Fetching transfers …")
     for tr in fetch_recent_transfers(SAUDI_PRO_LEAGUE_ID, CURRENT_SEASON):
         if tweets_today(state) >= MAX_TWEETS_PER_DAY:
@@ -496,6 +505,7 @@ def process_events(
             time.sleep(random.uniform(HUMANIZE_MIN_S, HUMANIZE_MAX_S))
 
     # ── 3. Injuries – SAFETY FILTER: no punchline, ever ──────────────────────
+    time.sleep(6)
     log.info("Fetching injuries …")
     for inj in fetch_injuries(SAUDI_PRO_LEAGUE_ID, CURRENT_SEASON)[:10]:
         if tweets_today(state) >= MAX_TWEETS_PER_DAY:
