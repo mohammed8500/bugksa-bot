@@ -107,16 +107,30 @@ GEMINI_CONSTITUTION = """
 
 
 def load_state() -> dict:
+    state = {}
     if STATE_FILE.exists():
         try:
             with STATE_FILE.open("r", encoding="utf-8") as f:
-                return json.load(f)
+                state = json.load(f)
         except Exception:
             pass
-    return {
-        "posted_event_ids": [],   # deduplication keys (live events + FT fixtures)
-        "tweets_today":     [],   # Unix timestamps of posts in last 24 h
-    }
+
+    # Migrate old state format: actions_log → tweets_today
+    if "actions_log" in state and "tweets_today" not in state:
+        cutoff = time.time() - 86400
+        state["tweets_today"] = [
+            t for t in state["actions_log"] if t > cutoff
+        ]
+        migrated = len(state["tweets_today"])
+        if migrated:
+            log.warning(
+                "Migrated %d tweet(s) from old 'actions_log' → 'tweets_today'",
+                migrated,
+            )
+
+    state.setdefault("posted_event_ids", [])
+    state.setdefault("tweets_today", [])
+    return state
 
 
 def save_state(state: dict) -> None:
@@ -154,6 +168,35 @@ def make_gemini_client() -> "genai.Client":
     client = genai.Client(api_key=GEMINI_API_KEY)
     log.info("[Gemini] client ready – model: %s", GEMINI_MODEL)
     return client
+
+
+def check_football_api_quota() -> None:
+    """Log API-Football quota status at startup to catch exhaustion early."""
+    try:
+        r = requests.get(
+            f"{FOOTBALL_API_BASE}/status",
+            headers={"x-apisports-key": FOOTBALL_API_KEY},
+            timeout=10,
+        )
+        r.raise_for_status()
+        body = r.json().get("response", {})
+        sub  = body.get("subscription", {})
+        req  = body.get("requests", {})
+        plan    = sub.get("plan", "?")
+        current = req.get("current", "?")
+        limit   = req.get("limit_day", "?")
+        log.info(
+            "[API-Football] quota: %s/%s requests used today | plan=%s",
+            current, limit, plan,
+        )
+        if isinstance(current, int) and isinstance(limit, int) and current >= limit:
+            log.error(
+                "[API-Football] ❌ DAILY QUOTA EXHAUSTED (%d/%d) – "
+                "bot will get 0 fixtures until midnight UTC!",
+                current, limit,
+            )
+    except Exception as e:
+        log.warning("[API-Football] Could not check quota: %s", e)
 
 
 # ── Gemini punchline generation ───────────────────────────────────────────────
@@ -244,7 +287,20 @@ def _football_get(endpoint: str, params: dict) -> list:
                 time.sleep(wait)
                 continue
             r.raise_for_status()
-            return r.json().get("response", [])
+            body = r.json()
+            api_errors = body.get("errors")
+            if api_errors:
+                log.error(
+                    "[API-Football] /%s returned errors: %s", endpoint, api_errors
+                )
+                return []
+            results = body.get("response", [])
+            if not results:
+                log.warning(
+                    "[API-Football] /%s params=%s → 0 results (quota exhausted or no data)",
+                    endpoint, params,
+                )
+            return results
         except requests.HTTPError as e:
             if r.status_code == 403:
                 log.warning(
@@ -267,7 +323,7 @@ def _football_get(endpoint: str, params: dict) -> list:
 
 def fetch_today_fixtures(league_id: int) -> list[dict]:
     """Fetch ALL of today's fixtures for one league (any status)."""
-    today = datetime.now().strftime("%Y-%m-%d")
+    today = datetime.utcnow().strftime("%Y-%m-%d")  # API-Football dates are UTC
     fixtures = _football_get("fixtures", {
         "league": league_id,
         "season": CURRENT_SEASON,
@@ -308,8 +364,9 @@ def fetch_fixture_events(fixture_id: int) -> list[dict]:
 
 def fetch_recent_fixtures(league_ids: list[int]) -> list[dict]:
     """Return finished fixtures from the last 2 days for all leagues."""
-    from_date = (datetime.now() - timedelta(days=2)).strftime("%Y-%m-%d")
-    to_date   = datetime.now().strftime("%Y-%m-%d")
+    now = datetime.utcnow()
+    from_date = (now - timedelta(days=2)).strftime("%Y-%m-%d")
+    to_date   = now.strftime("%Y-%m-%d")
     results: list[dict] = []
     for league_id in league_ids:
         results.extend(_football_get("fixtures", {
@@ -510,6 +567,7 @@ def main() -> None:
 
     v2     = make_twitter_v2()
     gemini = make_gemini_client()
+    check_football_api_quota()
     state  = load_state()
 
     if not state.get("posted_event_ids"):
