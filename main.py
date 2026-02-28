@@ -76,9 +76,18 @@ POLL_INTERVAL_IDLE_S = 15 * 60  # 15 minutes when no live matches
 HUMANIZE_MIN_S       = 15        # minimum sleep between posts within a cycle
 HUMANIZE_MAX_S       = 45        # maximum sleep between posts within a cycle
 
-# API-Football league / season (override via env if needed)
-SAUDI_PRO_LEAGUE_ID = int(os.getenv("FOOTBALL_LEAGUE_ID", "307"))
-CURRENT_SEASON      = int(os.getenv("FOOTBALL_SEASON",    "2025"))
+# API-Football leagues / season
+# FOOTBALL_LEAGUE_IDS: comma-separated league IDs (default: 307 = Saudi Pro League)
+# Example for Saudi + Premier League: FOOTBALL_LEAGUE_IDS=307,39
+LEAGUE_IDS     = [
+    int(x.strip())
+    for x in os.getenv("FOOTBALL_LEAGUE_IDS", "307").split(",")
+    if x.strip()
+]
+CURRENT_SEASON = int(os.getenv("FOOTBALL_SEASON", "2025"))
+
+# Fixture statuses considered "in progress" (checked in Python, no live= param needed)
+_LIVE_STATUSES = {"1H", "HT", "2H", "ET", "BT", "P", "LIVE"}
 
 # ── Gemini Constitution (system prompt – used verbatim) ───────────────────────
 
@@ -256,32 +265,40 @@ def _football_get(endpoint: str, params: dict) -> list:
 # ── Fetch helpers ─────────────────────────────────────────────────────────────
 
 
-def fetch_live_fixtures(league_id: int) -> list[dict]:
-    """Return currently live fixtures for the league.
-
-    Tries ?live=all first (requires higher API tier); falls back to querying
-    today's fixtures with in-progress statuses (1H, HT, 2H, ET, P) which
-    works on all subscription tiers.
-    """
+def fetch_today_fixtures(league_id: int) -> list[dict]:
+    """Fetch ALL of today's fixtures for one league (any status)."""
     today = datetime.now().strftime("%Y-%m-%d")
-
-    # Primary: live endpoint
-    results = _football_get("fixtures", {
-        "league": league_id,
-        "season": CURRENT_SEASON,
-        "live":   "all",
-    })
-    if results:
-        return results
-
-    # Fallback: today's fixtures filtered to in-progress statuses
-    log.info("live=all returned nothing – trying in-progress status fallback …")
-    return _football_get("fixtures", {
+    fixtures = _football_get("fixtures", {
         "league": league_id,
         "season": CURRENT_SEASON,
         "date":   today,
-        "status": "1H-HT-2H-ET-P",
     })
+    log.info(
+        "[league=%d] today=%s → %d fixture(s) total",
+        league_id, today, len(fixtures),
+    )
+    return fixtures
+
+
+def fetch_live_fixtures(league_ids: list[int]) -> list[dict]:
+    """Return in-progress fixtures across all configured leagues.
+
+    Fetches today's fixtures per league then filters by status in Python.
+    Does NOT use ?live=all (requires higher API tiers) – works on free plans.
+    """
+    live: list[dict] = []
+    for league_id in league_ids:
+        for fix in fetch_today_fixtures(league_id):
+            status = fix.get("fixture", {}).get("status", {}).get("short", "")
+            if status in _LIVE_STATUSES:
+                live.append(fix)
+                log.info(
+                    "[league=%d] fixture %s is LIVE (status=%s)",
+                    league_id,
+                    fix.get("fixture", {}).get("id"),
+                    status,
+                )
+    return live
 
 
 def fetch_fixture_events(fixture_id: int) -> list[dict]:
@@ -289,17 +306,20 @@ def fetch_fixture_events(fixture_id: int) -> list[dict]:
     return _football_get("fixtures/events", {"fixture": fixture_id})
 
 
-def fetch_recent_fixtures(league_id: int, season: int) -> list[dict]:
-    """Return finished fixtures from the last 2 days."""
+def fetch_recent_fixtures(league_ids: list[int]) -> list[dict]:
+    """Return finished fixtures from the last 2 days for all leagues."""
     from_date = (datetime.now() - timedelta(days=2)).strftime("%Y-%m-%d")
     to_date   = datetime.now().strftime("%Y-%m-%d")
-    return _football_get("fixtures", {
-        "league": league_id,
-        "season": season,
-        "from":   from_date,
-        "to":     to_date,
-        "status": "FT",
-    })
+    results: list[dict] = []
+    for league_id in league_ids:
+        results.extend(_football_get("fixtures", {
+            "league": league_id,
+            "season": CURRENT_SEASON,
+            "from":   from_date,
+            "to":     to_date,
+            "status": "FT",
+        }))
+    return results
 
 
 # ── Event key for deduplication ───────────────────────────────────────────────
@@ -402,8 +422,8 @@ def process_events(
     posted = 0
 
     # ── Step 1: Live fixtures ─────────────────────────────────────────────────
-    log.info("Fetching live fixtures …")
-    live_fixtures = fetch_live_fixtures(SAUDI_PRO_LEAGUE_ID)
+    log.info("Fetching live fixtures for leagues=%s …", LEAGUE_IDS)
+    live_fixtures = fetch_live_fixtures(LEAGUE_IDS)
 
     if live_fixtures:
         log.info("%d live fixture(s) in progress", len(live_fixtures))
@@ -445,7 +465,7 @@ def process_events(
 
     # ── Step 2: No live matches – check FT results (silent mode) ──────────────
     log.info("No live fixtures – checking FT results …")
-    raw_fixtures = fetch_recent_fixtures(SAUDI_PRO_LEAGUE_ID, CURRENT_SEASON)
+    raw_fixtures = fetch_recent_fixtures(LEAGUE_IDS)
 
     new_fixtures = [
         (f"fixture_{fix.get('fixture', {}).get('id', '')}", fix)
