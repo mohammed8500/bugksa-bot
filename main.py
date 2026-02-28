@@ -8,6 +8,7 @@ Architecture
 ------------
   Layer 1 – Daily cap         (≤ MAX_TWEETS_PER_DAY)
   Layer 2 – Gemini punchline  (GEMINI_CONSTITUTION enforces identity)
+  Layer 3 – Live mode         (goals + cards every 2 min during matches)
 
 Environment variables
 ---------------------
@@ -69,12 +70,13 @@ DRY_RUN           = os.getenv("DRY_RUN", "false").lower() in ("1", "true", "yes"
 STATE_FILE        = Path(os.getenv("STATE_FILE_PATH", "/app/data/state.json").strip())
 STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
 
-MAX_TWEETS_PER_DAY = 50        # absolute daily ceiling
-POLL_INTERVAL_S    = 15 * 60   # 15 minutes between cycles
-HUMANIZE_MIN_S     = 30        # minimum sleep between posts within a cycle
-HUMANIZE_MAX_S     = 90        # maximum sleep between posts within a cycle
+MAX_TWEETS_PER_DAY   = 50        # absolute daily ceiling
+POLL_INTERVAL_LIVE_S = 2 * 60   # 2 minutes when live matches are happening
+POLL_INTERVAL_IDLE_S = 15 * 60  # 15 minutes when no live matches
+HUMANIZE_MIN_S       = 15        # minimum sleep between posts within a cycle
+HUMANIZE_MAX_S       = 45        # maximum sleep between posts within a cycle
 
-# API-Football league / season (override via env if free-tier restricts league 307)
+# API-Football league / season (override via env if needed)
 SAUDI_PRO_LEAGUE_ID = int(os.getenv("FOOTBALL_LEAGUE_ID", "307"))
 CURRENT_SEASON      = int(os.getenv("FOOTBALL_SEASON",    "2024"))
 
@@ -103,15 +105,15 @@ def load_state() -> dict:
         except Exception:
             pass
     return {
-        "posted_event_ids": [],   # deduplication keys
+        "posted_event_ids": [],   # deduplication keys (live events + FT fixtures)
         "tweets_today":     [],   # Unix timestamps of posts in last 24 h
     }
 
 
 def save_state(state: dict) -> None:
     cutoff = time.time() - 86400
-    state["tweets_today"]    = [t for t in state.get("tweets_today", []) if t > cutoff]
-    state["posted_event_ids"] = state.get("posted_event_ids", [])[-1000:]
+    state["tweets_today"]     = [t for t in state.get("tweets_today", []) if t > cutoff]
+    state["posted_event_ids"] = state.get("posted_event_ids", [])[-2000:]
     tmp = STATE_FILE.with_suffix(".tmp")
     with tmp.open("w", encoding="utf-8") as f:
         json.dump(state, f, ensure_ascii=False, indent=2)
@@ -127,13 +129,6 @@ def tweets_today(state: dict) -> int:
 
 
 def make_twitter_v2() -> "tweepy.Client":
-    """Return a v2 Client for posting tweets.
-
-    wait_on_rate_limit=False: disables tweepy's background polling of Twitter
-    rate-limit endpoints, which consumes API credits even when no tweet is posted.
-    We handle 429s manually via the football API retry logic; Twitter 429s are
-    caught in post_tweet() and logged without retrying.
-    """
     return tweepy.Client(
         consumer_key=X_API_KEY,
         consumer_secret=X_API_SECRET,
@@ -156,11 +151,7 @@ def make_gemini_client() -> "genai.Client":
 
 
 def generate_punchline(client: "genai.Client", news_text: str) -> str:
-    """Generate a sarcastic punchline via Gemini.
-
-    Returns the punchline string, or '' on any error.
-    The caller must NOT call this for injury news (safety filter).
-    """
+    """Generate a sarcastic punchline via Gemini. Returns '' on any error."""
     prompt = f"الخبر:\n{news_text}\n\nاكتب القفلة الساخرة الآن (سطر واحد فقط):"
     try:
         resp = client.models.generate_content(
@@ -185,13 +176,12 @@ def generate_punchline(client: "genai.Client", news_text: str) -> str:
 
 
 def build_tweet_text(news: str, punchline: str) -> str:
-    """Return final tweet: serious news + blank line + punchline (≤ 280 chars)."""
+    """Return final tweet: news + blank line + punchline (≤ 280 chars)."""
     if not punchline:
         return news[:280]
     combined = f"{news}\n\n{punchline}"
     if len(combined) <= 280:
         return combined
-    # Trim news to fit, preserving the full punchline
     overhead = len("\n\n") + len(punchline)
     trimmed_news = news[: 280 - overhead - 1].rstrip() + "…"
     return f"{trimmed_news}\n\n{punchline}"
@@ -201,13 +191,7 @@ def build_tweet_text(news: str, punchline: str) -> str:
 
 
 def post_tweet(v2: "tweepy.Client", state: dict, text: str) -> bool:
-    """Post *text* using the v2 Client.
-
-    Respects the daily cap and DRY_RUN flag.
-    This is the ONLY function that contacts Twitter – called only when a new
-    FT fixture is confirmed by the football API (Silent Mode gate).
-    Returns True on success (or dry-run), False otherwise.
-    """
+    """Post *text* via v2. Respects daily cap and DRY_RUN flag."""
     count = tweets_today(state)
     if count >= MAX_TWEETS_PER_DAY:
         log.warning("Daily cap reached (%d/%d) – skipping", count, MAX_TWEETS_PER_DAY)
@@ -235,13 +219,8 @@ def post_tweet(v2: "tweepy.Client", state: dict, text: str) -> bool:
 
 
 def _football_get(endpoint: str, params: dict) -> list:
-    """Call API-Football endpoint and return the `response` list, or [].
-
-    Retries up to 3 times on 429 (rate limit) with exponential back-off.
-    """
-    headers = {
-        "x-apisports-key": FOOTBALL_API_KEY,
-    }
+    """Call API-Football endpoint, return `response` list or []."""
+    headers = {"x-apisports-key": FOOTBALL_API_KEY}
     for attempt in range(3):
         try:
             r = requests.get(
@@ -251,8 +230,8 @@ def _football_get(endpoint: str, params: dict) -> list:
                 timeout=15,
             )
             if r.status_code == 429:
-                wait = 60 * (2 ** attempt)   # 60 s → 120 s → 240 s
-                log.warning("[API-Football] 429 rate-limit on %s – waiting %ds", endpoint, wait)
+                wait = 60 * (2 ** attempt)
+                log.warning("[API-Football] 429 on %s – waiting %ds", endpoint, wait)
                 time.sleep(wait)
                 continue
             r.raise_for_status()
@@ -274,7 +253,21 @@ def _football_get(endpoint: str, params: dict) -> list:
     return []
 
 
-# ── Fetch: match results ──────────────────────────────────────────────────────
+# ── Fetch helpers ─────────────────────────────────────────────────────────────
+
+
+def fetch_live_fixtures(league_id: int) -> list[dict]:
+    """Return currently live fixtures for the league."""
+    return _football_get("fixtures", {
+        "league":  league_id,
+        "season":  CURRENT_SEASON,
+        "live":    "all",
+    })
+
+
+def fetch_fixture_events(fixture_id: int) -> list[dict]:
+    """Return all events for a specific fixture."""
+    return _football_get("fixtures/events", {"fixture": fixture_id})
 
 
 def fetch_recent_fixtures(league_id: int, season: int) -> list[dict]:
@@ -290,8 +283,70 @@ def fetch_recent_fixtures(league_id: int, season: int) -> list[dict]:
     })
 
 
-def format_fixture_news(fix: dict) -> tuple[str, str | None]:
-    """Return (news_text, image_url=None) for a finished match."""
+# ── Event key for deduplication ───────────────────────────────────────────────
+
+
+def _event_key(fixture_id: int, event: dict) -> str:
+    elapsed    = event.get("time", {}).get("elapsed", 0)
+    extra      = event.get("time", {}).get("extra") or 0
+    player_id  = event.get("player", {}).get("id", 0)
+    event_type = event.get("type", "")
+    detail     = event.get("detail", "")
+    return f"live_{fixture_id}_{elapsed}_{extra}_{event_type}_{detail}_{player_id}"
+
+
+# ── Event formatters ──────────────────────────────────────────────────────────
+
+
+def _minute_str(event: dict) -> str:
+    elapsed = event.get("time", {}).get("elapsed", "?")
+    extra   = event.get("time", {}).get("extra")
+    return f"{elapsed}+{extra}'" if extra else f"{elapsed}'"
+
+
+def format_live_event(event: dict, fixture: dict) -> str | None:
+    """Format a live event into Arabic news text.
+
+    Returns None for events we skip (substitutions, VAR reviews, etc.).
+    Goals and cards (yellow/red) are always returned.
+    """
+    event_type = (event.get("type") or "").lower()
+    detail     = event.get("detail") or ""
+    player     = event.get("player", {}).get("name") or "لاعب"
+    team_name  = event.get("team",   {}).get("name") or "الفريق"
+    minute     = _minute_str(event)
+
+    home = fixture.get("teams", {}).get("home", {}).get("name", "؟")
+    away = fixture.get("teams", {}).get("away", {}).get("name", "؟")
+
+    # Live fixtures expose current score under "goals"
+    goals = fixture.get("goals", {})
+    sh = goals.get("home") if goals.get("home") is not None else 0
+    sa = goals.get("away") if goals.get("away") is not None else 0
+    score_line = f"{home} {sh} – {sa} {away}"
+
+    if event_type == "goal":
+        if detail == "Own Goal":
+            return f"⚽ هدف في المرمى! {player} ({team_name})\n{score_line}\n⏱ {minute}"
+        elif detail == "Penalty":
+            return f"⚽ ركلة جزاء | {player} ({team_name})\n{score_line}\n⏱ {minute}"
+        elif detail == "Missed Penalty":
+            return f"❌ ركلة جزاء ضائعة! {player} ({team_name})\n{score_line}\n⏱ {minute}"
+        else:
+            return f"⚽ هدف! {player} ({team_name})\n{score_line}\n⏱ {minute}"
+
+    elif event_type == "card":
+        if "Red" in detail or "Second" in detail:
+            return f"🟥 كرت أحمر! {player} ({team_name})\n{score_line}\n⏱ {minute}"
+        elif "Yellow" in detail:
+            return f"🟨 كرت أصفر | {player} ({team_name})\n{score_line}\n⏱ {minute}"
+
+    # Substitutions, VAR, and other events – skip silently
+    return None
+
+
+def format_fixture_news(fix: dict) -> str:
+    """Format a finished match result."""
     league  = fix.get("league", {})
     teams   = fix.get("teams", {})
     goals   = fix.get("goals", {})
@@ -301,12 +356,11 @@ def format_fixture_news(fix: dict) -> tuple[str, str | None]:
     hg      = goals.get("home") or 0
     ag      = goals.get("away") or 0
     date_s  = (fixture.get("date") or "")[:10]
-    news = (
+    return (
         f"⚽ نتيجة | {league.get('name', 'الدوري')}\n"
         f"{home} {hg} – {ag} {away}\n"
         f"📅 {date_s}"
     )
-    return news, None          # no player image for match results
 
 
 # ── Main event-processing loop ────────────────────────────────────────────────
@@ -316,40 +370,81 @@ def process_events(
     v2:     "tweepy.Client",
     gemini: "genai.Client",
     state:  dict,
-) -> int:
-    """Fetch fixtures and post new FT results.
+) -> tuple[int, bool]:
+    """Fetch and post new live events or FT results.
 
-    Silent Mode: Twitter (v2.create_tweet) is contacted ONLY when at least one
-    new finished match is found.  API-Football polling is free and happens every
-    cycle; Twitter is never contacted otherwise.
+    Returns (tweets_posted, has_live_matches).
+
+    Priority:
+      1. Live matches exist → poll events every 2 min, tweet goals + cards.
+      2. No live matches    → check FT results, tweet summaries (silent mode).
     """
     posted_ids = set(state.get("posted_event_ids", []))
+    posted = 0
 
-    # ── Step 1: poll API-Football (zero Twitter contact) ──────────────────────
-    log.info("Fetching fixtures …")
+    # ── Step 1: Live fixtures ─────────────────────────────────────────────────
+    log.info("Fetching live fixtures …")
+    live_fixtures = fetch_live_fixtures(SAUDI_PRO_LEAGUE_ID)
+
+    if live_fixtures:
+        log.info("%d live fixture(s) in progress", len(live_fixtures))
+
+        for fixture in live_fixtures:
+            fixture_id = fixture.get("fixture", {}).get("id")
+            if not fixture_id:
+                continue
+
+            events = fetch_fixture_events(fixture_id)
+            new_events = [e for e in events if _event_key(fixture_id, e) not in posted_ids]
+
+            for event in new_events:
+                key  = _event_key(fixture_id, event)
+                news = format_live_event(event, fixture)
+
+                if not news:
+                    # Mark skipped events (substitutions, etc.) as seen
+                    posted_ids.add(key)
+                    state.setdefault("posted_event_ids", []).append(key)
+                    continue
+
+                if tweets_today(state) >= MAX_TWEETS_PER_DAY:
+                    log.warning("Daily cap reached – stopping early")
+                    save_state(state)
+                    return posted, True
+
+                punchline  = generate_punchline(gemini, news)
+                tweet_text = build_tweet_text(news, punchline)
+
+                if post_tweet(v2, state, tweet_text):
+                    posted += 1
+                    posted_ids.add(key)
+                    state.setdefault("posted_event_ids", []).append(key)
+                    save_state(state)
+                    time.sleep(random.uniform(HUMANIZE_MIN_S, HUMANIZE_MAX_S))
+
+        return posted, True
+
+    # ── Step 2: No live matches – check FT results (silent mode) ──────────────
+    log.info("No live fixtures – checking FT results …")
     raw_fixtures = fetch_recent_fixtures(SAUDI_PRO_LEAGUE_ID, CURRENT_SEASON)
 
-    new_fixtures: list[tuple[str, dict]] = []
-    for fix in raw_fixtures:
-        key = f"fixture_{fix.get('fixture', {}).get('id', '')}"
-        if key and key not in posted_ids:
-            new_fixtures.append((key, fix))
+    new_fixtures = [
+        (f"fixture_{fix.get('fixture', {}).get('id', '')}", fix)
+        for fix in raw_fixtures
+        if f"fixture_{fix.get('fixture', {}).get('id', '')}" not in posted_ids
+    ]
 
-    # ── Silent gate: nothing new → Twitter never touched ──────────────────────
     if not new_fixtures:
         log.info("Silent – no new FT fixtures found, Twitter not contacted")
-        return 0
+        return 0, False
 
     log.info("%d new FT fixture(s) queued for posting", len(new_fixtures))
-
-    # ── Step 2: only now do we interact with Twitter ───────────────────────────
-    posted = 0
     for key, fix in new_fixtures:
         if tweets_today(state) >= MAX_TWEETS_PER_DAY:
             log.warning("Daily cap reached – stopping early")
             break
 
-        news, _    = format_fixture_news(fix)
+        news       = format_fixture_news(fix)
         punchline  = generate_punchline(gemini, news)
         tweet_text = build_tweet_text(news, punchline)
 
@@ -360,7 +455,7 @@ def process_events(
             posted += 1
             time.sleep(random.uniform(HUMANIZE_MIN_S, HUMANIZE_MAX_S))
 
-    return posted
+    return posted, False
 
 
 # ── Entry point ───────────────────────────────────────────────────────────────
@@ -379,22 +474,38 @@ def main() -> None:
     state  = load_state()
 
     if not state.get("posted_event_ids"):
-        log.warning("State is empty – this may be a fresh start or lost state file. "
-                    "Old fixtures from the last 2 days will be treated as new.")
+        log.warning(
+            "State is empty – this may be a fresh start or lost state file. "
+            "Old fixtures from the last 2 days will be treated as new."
+        )
 
     cycle = 0
     while True:
         cycle += 1
-        log.info("── Cycle %d ── tweets_today=%d/%d", cycle, tweets_today(state), MAX_TWEETS_PER_DAY)
+        log.info(
+            "── Cycle %d ── tweets_today=%d/%d",
+            cycle, tweets_today(state), MAX_TWEETS_PER_DAY,
+        )
         try:
-            n = process_events(v2, gemini, state)
-            log.info("Cycle %d complete: posted %d tweet(s)", cycle, n)
+            n, is_live = process_events(v2, gemini, state)
+            log.info(
+                "Cycle %d complete: posted %d tweet(s) | live=%s",
+                cycle, n, is_live,
+            )
         except Exception as e:
             log.error("Cycle %d unhandled error: %s", cycle, e)
+            is_live = False
 
-        # Humanized interval: 15 min ± 1 min
-        sleep_s = POLL_INTERVAL_S + random.randint(-60, 60)
-        log.info("Sleeping %ds (%.1f min) …", sleep_s, sleep_s / 60)
+        # Smart interval: 2 min during live matches, 15 min otherwise
+        if is_live:
+            sleep_s = POLL_INTERVAL_LIVE_S + random.randint(-15, 15)
+        else:
+            sleep_s = POLL_INTERVAL_IDLE_S + random.randint(-60, 60)
+
+        log.info(
+            "Sleeping %ds (%.1f min) … [mode=%s]",
+            sleep_s, sleep_s / 60, "LIVE" if is_live else "idle",
+        )
         time.sleep(sleep_s)
 
 
