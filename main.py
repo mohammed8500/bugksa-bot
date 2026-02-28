@@ -15,7 +15,7 @@ Environment variables
 ---------------------
   X_API_KEY, X_API_SECRET, X_ACCESS_TOKEN, X_ACCESS_SECRET
   GEMINI_API_KEY
-  FOOTBALL_API_KEY          (RapidAPI key for api-football-v1)
+  FOOTBALL_API_KEY          (API key from api-sports.io direct subscription)
   GEMINI_MODEL              (default: gemini-1.5-flash)
   DRY_RUN                   (1/true/yes → no real posts)
   STATE_FILE_PATH           (default: /app/data/state.json)
@@ -63,10 +63,9 @@ X_ACCESS_SECRET = _env("X_ACCESS_SECRET")
 GEMINI_API_KEY  = _env("GEMINI_API_KEY")
 GEMINI_MODEL    = os.getenv("GEMINI_MODEL", "gemini-1.5-flash").strip()
 
-# API-Football (via RapidAPI)
+# API-Sports (direct subscription – https://api-sports.io)
 FOOTBALL_API_KEY  = _env("FOOTBALL_API_KEY")
-FOOTBALL_API_HOST = "api-football-v1.p.rapidapi.com"
-FOOTBALL_API_BASE = "https://api-football-v1.p.rapidapi.com/v3"
+FOOTBALL_API_BASE = "https://v3.football.api-sports.io"
 
 # Bot behaviour
 DRY_RUN           = os.getenv("DRY_RUN", "false").lower() in ("1", "true", "yes")
@@ -304,8 +303,7 @@ def _football_get(endpoint: str, params: dict) -> list:
     Retries up to 3 times on 429 (rate limit) with exponential back-off.
     """
     headers = {
-        "X-RapidAPI-Key":  FOOTBALL_API_KEY,
-        "X-RapidAPI-Host": FOOTBALL_API_HOST,
+        "x-apisports-key": FOOTBALL_API_KEY,
     }
     for attempt in range(3):
         try:
@@ -326,8 +324,7 @@ def _football_get(endpoint: str, params: dict) -> list:
             if r.status_code == 403:
                 log.warning(
                     "[API-Football] 403 Forbidden on /%s – "
-                    "this endpoint may require a paid RapidAPI plan. "
-                    "Set FOOTBALL_LEAGUE_ID to a free-tier league (e.g. 39=Premier League).",
+                    "تحقق من صلاحية FOOTBALL_API_KEY في api-sports.io",
                     endpoint,
                 )
             else:
