@@ -32,7 +32,8 @@ from datetime import datetime, timedelta
 
 import requests
 import tweepy
-import google.generativeai as genai
+from google import genai
+from google.genai import types as genai_types
 
 # ── Logging ───────────────────────────────────────────────────────────────────
 
@@ -168,20 +169,16 @@ def make_twitter_clients() -> tuple["tweepy.Client", "tweepy.API"]:
 # ── Gemini client ─────────────────────────────────────────────────────────────
 
 
-def make_gemini_model() -> "genai.GenerativeModel":
-    genai.configure(api_key=GEMINI_API_KEY)
-    model = genai.GenerativeModel(
-        model_name=GEMINI_MODEL,
-        system_instruction=GEMINI_CONSTITUTION,
-    )
-    log.info("[Gemini] model ready: %s", GEMINI_MODEL)
-    return model
+def make_gemini_client() -> "genai.Client":
+    client = genai.Client(api_key=GEMINI_API_KEY)
+    log.info("[Gemini] client ready – model: %s", GEMINI_MODEL)
+    return client
 
 
 # ── Gemini punchline generation ───────────────────────────────────────────────
 
 
-def generate_punchline(model: "genai.GenerativeModel", news_text: str) -> str:
+def generate_punchline(client: "genai.Client", news_text: str) -> str:
     """Generate a sarcastic punchline via Gemini.
 
     Returns the punchline string, or '' on any error.
@@ -189,15 +186,16 @@ def generate_punchline(model: "genai.GenerativeModel", news_text: str) -> str:
     """
     prompt = f"الخبر:\n{news_text}\n\nاكتب القفلة الساخرة الآن (سطر واحد فقط):"
     try:
-        resp = model.generate_content(
-            prompt,
-            generation_config=genai.types.GenerationConfig(
+        resp = client.models.generate_content(
+            model=GEMINI_MODEL,
+            contents=prompt,
+            config=genai_types.GenerateContentConfig(
+                system_instruction=GEMINI_CONSTITUTION,
                 max_output_tokens=100,
                 temperature=0.9,
             ),
         )
         text = (resp.text or "").strip()
-        # Ensure the required prefix is present
         if text and not text.startswith("🤖"):
             text = "🤖 تعليق النظام: " + text
         return text[:240]
@@ -301,23 +299,37 @@ def post_tweet(
 
 
 def _football_get(endpoint: str, params: dict) -> list:
-    """Call API-Football endpoint and return the `response` list, or []."""
+    """Call API-Football endpoint and return the `response` list, or [].
+
+    Retries up to 3 times on 429 (rate limit) with exponential back-off.
+    """
     headers = {
         "X-RapidAPI-Key":  FOOTBALL_API_KEY,
         "X-RapidAPI-Host": FOOTBALL_API_HOST,
     }
-    try:
-        r = requests.get(
-            f"{FOOTBALL_API_BASE}/{endpoint}",
-            headers=headers,
-            params=params,
-            timeout=15,
-        )
-        r.raise_for_status()
-        return r.json().get("response", [])
-    except Exception as e:
-        log.error("[API-Football] %s %s: %s", endpoint, params, e)
-        return []
+    for attempt in range(3):
+        try:
+            r = requests.get(
+                f"{FOOTBALL_API_BASE}/{endpoint}",
+                headers=headers,
+                params=params,
+                timeout=15,
+            )
+            if r.status_code == 429:
+                wait = 60 * (2 ** attempt)   # 60 s → 120 s → 240 s
+                log.warning("[API-Football] 429 rate-limit on %s – waiting %ds", endpoint, wait)
+                time.sleep(wait)
+                continue
+            r.raise_for_status()
+            return r.json().get("response", [])
+        except requests.HTTPError as e:
+            log.error("[API-Football] HTTP error %s %s: %s", endpoint, params, e)
+            return []
+        except Exception as e:
+            log.error("[API-Football] %s %s: %s", endpoint, params, e)
+            return []
+    log.error("[API-Football] %s gave 429 after 3 retries – skipping", endpoint)
+    return []
 
 
 # ── Fetch: match results ──────────────────────────────────────────────────────
@@ -526,7 +538,7 @@ def main() -> None:
     log.info("=" * 60)
 
     v2, v1   = make_twitter_clients()
-    gemini   = make_gemini_model()
+    gemini   = make_gemini_client()
     state    = load_state()
 
     cycle = 0
