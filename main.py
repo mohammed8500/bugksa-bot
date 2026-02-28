@@ -78,7 +78,7 @@ HUMANIZE_MAX_S       = 45        # maximum sleep between posts within a cycle
 
 # API-Football league / season (override via env if needed)
 SAUDI_PRO_LEAGUE_ID = int(os.getenv("FOOTBALL_LEAGUE_ID", "307"))
-CURRENT_SEASON      = int(os.getenv("FOOTBALL_SEASON",    "2024"))
+CURRENT_SEASON      = int(os.getenv("FOOTBALL_SEASON",    "2025"))
 
 # ── Gemini Constitution (system prompt – used verbatim) ───────────────────────
 
