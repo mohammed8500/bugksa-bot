@@ -337,10 +337,10 @@ def fetch_365_live() -> list[dict]:
     return live
 
 
-def fetch_365_current() -> tuple[list[dict], list[dict]]:
+def fetch_365_current() -> tuple[list[dict], list[dict], list[dict]]:
     """Fetch today's games from 365Scores in ONE API call.
 
-    Returns (live_games, finished_games).
+    Returns (live_games, finished_games, scheduled_games).
 
     Uses /web/games/current/ which reliably returns all of today's games
     for the competition (scheduled, live, and finished). The broken
@@ -349,18 +349,18 @@ def fetch_365_current() -> tuple[list[dict], list[dict]]:
     body  = _365scores_get("/web/games/current/", {"competitions": SCORES365_COMPETITION})
     games = body.get("games") or []
 
-    live     = [g for g in games if g.get("statusGroup") == _365_STATUS_LIVE]
-    finished = [g for g in games if g.get("statusGroup") == _365_STATUS_FINISHED]
-    scheduled = len(games) - len(live) - len(finished)
+    live      = [g for g in games if g.get("statusGroup") == _365_STATUS_LIVE]
+    finished  = [g for g in games if g.get("statusGroup") == _365_STATUS_FINISHED]
+    scheduled = [g for g in games if g.get("statusGroup") == _365_STATUS_NOT_STARTED]
 
     log.info(
         "[365Scores] /current competition=%d → %d total (%d live, %d finished, %d scheduled)",
-        SCORES365_COMPETITION, len(games), len(live), len(finished), scheduled,
+        SCORES365_COMPETITION, len(games), len(live), len(finished), len(scheduled),
     )
 
-    # If no live matches found, attempt a name-based search across ALL sports
-    # to catch the case where competition ID is stale/wrong
-    if not live and not finished and not games:
+    # If 0 total games, try a name-based Saudi league search in case the
+    # competition ID is stale/wrong
+    if not games:
         log.warning(
             "[365Scores] competition=%d returned 0 games – "
             "trying name-based Saudi league search …",
@@ -376,12 +376,39 @@ def fetch_365_current() -> tuple[list[dict], list[dict]]:
                     live.append(g)
                 elif g.get("statusGroup") == _365_STATUS_FINISHED:
                     finished.append(g)
+                elif g.get("statusGroup") == _365_STATUS_NOT_STARTED:
+                    scheduled.append(g)
                 log.info(
                     "[365Scores] found: competitionId=%s name=%r statusGroup=%s",
                     g.get("competitionId"), g.get("competitionName"), g.get("statusGroup"),
                 )
 
-    return live, finished
+    return live, finished, scheduled
+
+
+# 365Scores returns startTime in Riyadh local time (UTC+3)
+_RIYADH = timedelta(hours=3)
+
+
+def _parse_kickoff_utc(start_time_str: str) -> float | None:
+    """Parse a 365Scores startTime string (Riyadh UTC+3) → UTC Unix timestamp."""
+    if not start_time_str:
+        return None
+    try:
+        dt = datetime.fromisoformat(start_time_str[:19])  # "YYYY-MM-DDTHH:MM:SS"
+        return (dt - _RIYADH).replace(tzinfo=timezone.utc).timestamp()
+    except Exception:
+        return None
+
+
+def next_kickoff_utc(scheduled_games: list[dict]) -> float | None:
+    """Return UTC timestamp of the nearest future kickoff, or None if none known."""
+    now  = datetime.now(timezone.utc).timestamp()
+    upcoming = [
+        ts for g in scheduled_games
+        if (ts := _parse_kickoff_utc(g.get("startTime") or "")) and ts > now
+    ]
+    return min(upcoming) if upcoming else None
 
 
 def fetch_365_events(game_id: int) -> list[dict]:
@@ -688,10 +715,13 @@ def process_events(
     v2:     "tweepy.Client",
     gemini: "genai.Client",
     state:  dict,
-) -> tuple[int, bool]:
+) -> tuple[int, bool, float | None]:
     """Fetch and post new live events or FT results.
 
-    Returns (tweets_posted, has_live_matches).
+    Returns (tweets_posted, has_live_matches, next_kickoff_utc_ts).
+
+    next_kickoff_utc_ts: UTC timestamp of the nearest upcoming match,
+    or None if not known. Used by main() to sleep until just before kickoff.
 
     Priority:
       1. 365Scores live games       → tweet goals, cards, FT events (primary)
@@ -702,9 +732,10 @@ def process_events(
     posted_ids = set(state.get("posted_event_ids", []))
     posted     = 0
 
-    # ── 1 + 3. Single 365Scores call returns both live and finished games ──────
+    # ── 1 + 3. Single 365Scores call returns live, finished, and scheduled ─────
     log.info("Fetching today's games from 365Scores (competition=%d) …", SCORES365_COMPETITION)
-    live_365, finished_365 = fetch_365_current()
+    live_365, finished_365, scheduled_365 = fetch_365_current()
+    next_kick = next_kickoff_utc(scheduled_365)
 
     # ── 1. 365Scores: live games ──────────────────────────────────────────────
     if live_365:
@@ -733,10 +764,10 @@ def process_events(
 
                 cap_hit = not _try_post(v2, gemini, state, news, key, posted_ids)
                 if cap_hit:
-                    return posted, True
+                    return posted, True, None
                 posted += 1
 
-        return posted, True
+        return posted, True, None
 
     # ── 2. API-Football: live games (fallback) ────────────────────────────────
     log.info("365Scores: 0 live games – trying API-Football fallback …")
@@ -763,10 +794,10 @@ def process_events(
 
                 cap_hit = not _try_post(v2, gemini, state, news, key, posted_ids)
                 if cap_hit:
-                    return posted, True
+                    return posted, True, None
                 posted += 1
 
-        return posted, True
+        return posted, True, None
 
     # ── 3. Silent mode: 365Scores today's finished games (already fetched) ────
     log.info("No live matches – checking FT results from 365Scores …")
@@ -786,7 +817,7 @@ def process_events(
                 break
             posted += 1
 
-        return posted, False
+        return posted, False, next_kick
 
     # ── 4. Silent mode: API-Football recent FT (final fallback) ──────────────
     log.info("No 365Scores FT results – trying API-Football FT fallback …")
@@ -799,7 +830,7 @@ def process_events(
 
     if not new_fixtures:
         log.info("Silent – no new fixtures found, Twitter not contacted")
-        return 0, False
+        return 0, False, next_kick
 
     log.info("%d new FT fixture(s) via API-Football", len(new_fixtures))
     for key, fix in new_fixtures:
@@ -809,7 +840,7 @@ def process_events(
             break
         posted += 1
 
-    return posted, False
+    return posted, False, next_kick
 
 
 # ── Entry point ───────────────────────────────────────────────────────────────
@@ -848,23 +879,39 @@ def main() -> None:
             cycle, tweets_today(state), MAX_TWEETS_PER_DAY,
         )
         try:
-            n, is_live = process_events(v2, gemini, state)
+            n, is_live, next_kick = process_events(v2, gemini, state)
             log.info(
                 "Cycle %d complete: posted=%d | live=%s",
                 cycle, n, is_live,
             )
         except Exception as e:
             log.error("Cycle %d unhandled error: %s", cycle, e, exc_info=True)
-            is_live = False
+            is_live   = False
+            next_kick = None
 
-        sleep_s = (
-            POLL_INTERVAL_LIVE_S + random.randint(-15, 15)
-            if is_live
-            else POLL_INTERVAL_IDLE_S + random.randint(-60, 60)
-        )
+        if is_live:
+            # Matches in progress – poll every 5 minutes
+            sleep_s = POLL_INTERVAL_LIVE_S + random.randint(-15, 15)
+            mode    = "LIVE"
+        elif next_kick:
+            # No live matches but we know when the next one starts.
+            # Wake up 5 minutes before kickoff (min 60 s, max 12 h).
+            secs_until = next_kick - time.time()
+            sleep_s    = int(max(60, min(secs_until - 300, 12 * 3600)))
+            kick_local = datetime.fromtimestamp(next_kick, tz=timezone.utc) + _RIYADH
+            log.info(
+                "Next kickoff at %s AST – sleeping %ds (%.1f h) until 5 min before",
+                kick_local.strftime("%H:%M"), sleep_s, sleep_s / 3600,
+            )
+            mode = "waiting-for-kickoff"
+        else:
+            # No games known today – default idle polling
+            sleep_s = POLL_INTERVAL_IDLE_S + random.randint(-60, 60)
+            mode    = "idle"
+
         log.info(
             "Sleeping %ds (%.1f min) [mode=%s] …",
-            sleep_s, sleep_s / 60, "LIVE" if is_live else "idle",
+            sleep_s, sleep_s / 60, mode,
         )
         time.sleep(sleep_s)
 
