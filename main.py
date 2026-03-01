@@ -31,7 +31,7 @@ import time
 import random
 import logging
 from pathlib import Path
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 
 import requests
 import tweepy
@@ -307,17 +307,39 @@ def _365scores_get(path: str, params: dict) -> dict:
 
 
 def fetch_365_live() -> list[dict]:
-    """Return currently live Saudi Pro League games from 365Scores."""
+    """Return currently live Saudi Pro League games from 365Scores.
+
+    Tries the configured competition ID first. If it returns nothing, falls
+    back to fetching ALL live games and filtering for Saudi Pro League by name
+    so a wrong SCORES365_COMPETITION_ID does not silently break everything.
+    """
     body  = _365scores_get("/web/games/current/", {"competitions": SCORES365_COMPETITION})
     games = body.get("games") or []
     live  = [g for g in games if g.get("statusGroup") == _365_STATUS_LIVE]
-    log.info("[365Scores] /current → %d game(s) total, %d live", len(games), len(live))
+    log.info("[365Scores] /current → %d total, %d live (competition=%d)",
+             len(games), len(live), SCORES365_COMPETITION)
+
+    if not live:
+        # Fallback: fetch all live football games and filter by competition name
+        all_body  = _365scores_get("/web/games/current/", {})
+        all_games = all_body.get("games") or []
+        saudi_keywords = ("saudi", "pro league", "roshn", "دوري", "روشن")
+        for g in all_games:
+            comp_name = (g.get("competitionName") or "").lower()
+            if any(kw in comp_name for kw in saudi_keywords) and \
+               g.get("statusGroup") == _365_STATUS_LIVE:
+                live.append(g)
+                log.info(
+                    "[365Scores] fallback found Saudi game: competitionId=%s name=%r",
+                    g.get("competitionId"), g.get("competitionName"),
+                )
+
     return live
 
 
 def fetch_365_today() -> list[dict]:
     """Return all of today's games (any status) for the configured competition."""
-    today = datetime.utcnow().strftime("%d/%m/%Y")   # 365Scores uses DD/MM/YYYY
+    today = datetime.now(timezone.utc).strftime("%d/%m/%Y")   # 365Scores uses DD/MM/YYYY
     body  = _365scores_get("/web/games/", {
         "competitions": SCORES365_COMPETITION,
         "startDate":    today,
@@ -488,7 +510,7 @@ def check_football_api_quota() -> None:
 
 
 def fetch_today_fixtures(league_id: int) -> list[dict]:
-    today    = datetime.utcnow().strftime("%Y-%m-%d")
+    today    = datetime.now(timezone.utc).strftime("%Y-%m-%d")
     fixtures = _football_get("fixtures", {
         "league": league_id,
         "season": CURRENT_SEASON,
@@ -518,7 +540,7 @@ def fetch_fixture_events(fixture_id: int) -> list[dict]:
 
 
 def fetch_recent_fixtures(league_ids: list[int]) -> list[dict]:
-    now       = datetime.utcnow()
+    now       = datetime.now(timezone.utc)
     from_date = (now - timedelta(days=2)).strftime("%Y-%m-%d")
     to_date   = now.strftime("%Y-%m-%d")
     results: list[dict] = []
