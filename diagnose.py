@@ -201,4 +201,75 @@ if issues:
 else:
     print("  ✅  No obvious config issues – check API response above for 0-fixture root cause")
 
+# ── 6. 365Scores test ─────────────────────────────────────────────────────────
+print()
+print(SEP)
+print("6.  365SCORES  –  LIVE GAMES  (PRIMARY SOURCE)")
+print(SEP)
+
+COMP_ID     = int(env("SCORES365_COMPETITION_ID") or "653")
+BASE365     = "https://webws.365scores.com"
+BASE_PARAMS = {"appTypeId": 5, "langId": 1, "timezoneName": "Asia/Riyadh", "userCountryId": 215}
+HDR365 = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/122.0.0.0 Safari/537.36",
+    "Accept":     "application/json, text/plain, */*",
+    "Referer":    "https://www.365scores.com/",
+    "Origin":     "https://www.365scores.com",
+}
+
+print(f"  competition_id = {COMP_ID}  (env SCORES365_COMPETITION_ID)")
+try:
+    r = requests.get(
+        f"{BASE365}/web/games/current/",
+        headers=HDR365,
+        params={**BASE_PARAMS, "competitions": COMP_ID},
+        timeout=15,
+    )
+    print(f"  HTTP status: {r.status_code}")
+    if r.status_code == 200:
+        games = r.json().get("games") or []
+        live  = [g for g in games if g.get("statusGroup") == 2]
+        done  = [g for g in games if g.get("statusGroup") == 3]
+        print(f"  ✅  {len(games)} game(s): {len(live)} live, {len(done)} finished")
+        for g in live:
+            home = (g.get("homeCompetitor") or {}).get("name", "?")
+            away = (g.get("awayCompetitor") or {}).get("name", "?")
+            hg   = (g.get("homeCompetitor") or {}).get("score", "?")
+            ag   = (g.get("awayCompetitor") or {}).get("score", "?")
+            st   = g.get("shortStatusText", "?")
+            print(f"    🔴 [{st}] {home} {hg}–{ag} {away}  id={g.get('id')}")
+        if not live:
+            print("  ℹ️   No live games right now – test again during match hours")
+    elif r.status_code == 403:
+        print("  ❌  403 Forbidden – 365Scores blocked this IP or User-Agent")
+    else:
+        print(f"  ⚠️  Unexpected {r.status_code}: {r.text[:200]}")
+except Exception as e:
+    print(f"  ❌  Request failed: {e}")
+
+try:
+    today_str = datetime.now().strftime("%d/%m/%Y")
+    r2 = requests.get(
+        f"{BASE365}/web/games/",
+        headers=HDR365,
+        params={**BASE_PARAMS, "competitions": COMP_ID, "startDate": today_str, "endDate": today_str},
+        timeout=15,
+    )
+    if r2.status_code == 200:
+        all_games = r2.json().get("games") or []
+        print(f"\n  Today ({today_str}) – all statuses: {len(all_games)} game(s)")
+        for g in all_games:
+            home = (g.get("homeCompetitor") or {}).get("name", "?")
+            away = (g.get("awayCompetitor") or {}).get("name", "?")
+            hg   = (g.get("homeCompetitor") or {}).get("score", "?")
+            ag   = (g.get("awayCompetitor") or {}).get("score", "?")
+            sg   = g.get("statusGroup", "?")
+            st   = g.get("shortStatusText", "?")
+            kick = (g.get("startTime") or "")[:16]
+            print(f"    [{sg}/{st}] {home} {hg}–{ag} {away}  kick={kick}")
+    else:
+        print(f"  ⚠️  /web/games/ returned {r2.status_code}")
+except Exception as e:
+    print(f"  ❌  Today-games request failed: {e}")
+
 print()
