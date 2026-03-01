@@ -1,3 +1,6 @@
 tweepy>=4.14.0
 google-generativeai>=0.7.0
 python-dotenv>=1.0.0
+
+# ── madrasati_bot dependencies ─────────────────────────────────────────────
+playwright>=1.44.0
