@@ -84,7 +84,7 @@ LEAGUE_IDS     = [
     for x in os.getenv("FOOTBALL_LEAGUE_IDS", "307").split(",")
     if x.strip()
 ]
-CURRENT_SEASON = int(os.getenv("FOOTBALL_SEASON", "2025"))
+CURRENT_SEASON = int(os.getenv("FOOTBALL_SEASON", "2024"))
 
 # Fixture statuses considered "in progress" (checked in Python, no live= param needed)
 _LIVE_STATUSES = {"1H", "HT", "2H", "ET", "BT", "P", "LIVE"}
