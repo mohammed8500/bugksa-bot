@@ -337,17 +337,51 @@ def fetch_365_live() -> list[dict]:
     return live
 
 
-def fetch_365_today() -> list[dict]:
-    """Return all of today's games (any status) for the configured competition."""
-    today = datetime.now(timezone.utc).strftime("%d/%m/%Y")   # 365Scores uses DD/MM/YYYY
-    body  = _365scores_get("/web/games/", {
-        "competitions": SCORES365_COMPETITION,
-        "startDate":    today,
-        "endDate":      today,
-    })
+def fetch_365_current() -> tuple[list[dict], list[dict]]:
+    """Fetch today's games from 365Scores in ONE API call.
+
+    Returns (live_games, finished_games).
+
+    Uses /web/games/current/ which reliably returns all of today's games
+    for the competition (scheduled, live, and finished). The broken
+    /web/games/?startDate= endpoint is intentionally avoided.
+    """
+    body  = _365scores_get("/web/games/current/", {"competitions": SCORES365_COMPETITION})
     games = body.get("games") or []
-    log.info("[365Scores] today=%s → %d game(s)", today, len(games))
-    return games
+
+    live     = [g for g in games if g.get("statusGroup") == _365_STATUS_LIVE]
+    finished = [g for g in games if g.get("statusGroup") == _365_STATUS_FINISHED]
+    scheduled = len(games) - len(live) - len(finished)
+
+    log.info(
+        "[365Scores] /current competition=%d → %d total (%d live, %d finished, %d scheduled)",
+        SCORES365_COMPETITION, len(games), len(live), len(finished), scheduled,
+    )
+
+    # If no live matches found, attempt a name-based search across ALL sports
+    # to catch the case where competition ID is stale/wrong
+    if not live and not finished and not games:
+        log.warning(
+            "[365Scores] competition=%d returned 0 games – "
+            "trying name-based Saudi league search …",
+            SCORES365_COMPETITION,
+        )
+        all_body  = _365scores_get("/web/games/current/", {})
+        all_games = all_body.get("games") or []
+        saudi_kw  = ("saudi", "pro league", "roshn", "دوري", "روشن")
+        for g in all_games:
+            comp_name = (g.get("competitionName") or "").lower()
+            if any(kw in comp_name for kw in saudi_kw):
+                if g.get("statusGroup") == _365_STATUS_LIVE:
+                    live.append(g)
+                elif g.get("statusGroup") == _365_STATUS_FINISHED:
+                    finished.append(g)
+                log.info(
+                    "[365Scores] found: competitionId=%s name=%r statusGroup=%s",
+                    g.get("competitionId"), g.get("competitionName"), g.get("statusGroup"),
+                )
+
+    return live, finished
 
 
 def fetch_365_events(game_id: int) -> list[dict]:
@@ -668,10 +702,11 @@ def process_events(
     posted_ids = set(state.get("posted_event_ids", []))
     posted     = 0
 
-    # ── 1. 365Scores: live games ──────────────────────────────────────────────
-    log.info("Fetching live games from 365Scores (competition=%d) …", SCORES365_COMPETITION)
-    live_365 = fetch_365_live()
+    # ── 1 + 3. Single 365Scores call returns both live and finished games ──────
+    log.info("Fetching today's games from 365Scores (competition=%d) …", SCORES365_COMPETITION)
+    live_365, finished_365 = fetch_365_current()
 
+    # ── 1. 365Scores: live games ──────────────────────────────────────────────
     if live_365:
         log.info("%d live game(s) via 365Scores", len(live_365))
         for game in live_365:
@@ -733,13 +768,11 @@ def process_events(
 
         return posted, True
 
-    # ── 3. Silent mode: 365Scores today's finished games ─────────────────────
-    log.info("No live matches – checking today's FT results via 365Scores …")
-    today_games  = fetch_365_today()
+    # ── 3. Silent mode: 365Scores today's finished games (already fetched) ────
+    log.info("No live matches – checking FT results from 365Scores …")
     finished_365 = [
-        g for g in today_games
-        if g.get("statusGroup") == _365_STATUS_FINISHED
-        and f"365_ft_{g.get('id')}" not in posted_ids
+        g for g in finished_365
+        if f"365_ft_{g.get('id')}" not in posted_ids
     ]
 
     if finished_365:
