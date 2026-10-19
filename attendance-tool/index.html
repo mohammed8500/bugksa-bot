@@ -1,0 +1,150 @@
+<!doctype html><html lang="ar" dir="rtl"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover"><title>أداة تقرير الحضور والغياب</title><link rel="stylesheet" href="styles.css"></head><body>
+<div class="app">
+  <section class="toolbar">
+    <h1>أداة تقرير الحضور والغياب</h1>
+    <p>ارفع تقرير Microsoft Teams، واختر كشف الفصل، ثم أنشئ التقرير في صفحة واحدة بنفس الهوية المعتمدة.</p>
+    <div class="top-action">
+      <button class="primary jumbo" id="generateBtnTop">إنشاء التقرير الآن</button>
+      <span class="top-hint">بعد اختيار ملف Teams اضغط الزر مباشرة.</span>
+    </div>
+    <div class="grid">
+      <div class="field"><label>اسم المدرسة</label><input id="school" value="متوسطة معاوية بن خديج"></div>
+      <div class="field"><label>اسم المعلم</label><input id="teacher" value="محمد الجعيد"></div>
+      <div class="field"><label>مدير المدرسة</label><input id="principal" value="يوسف الشمري"></div>
+      <div class="field"><label>المادة</label><input id="subject" value="علوم"></div>
+
+      <div class="field"><label>الصف</label><input id="grade" value="ثاني متوسط"></div>
+      <div class="field"><label>الفصل</label><input id="section" value="3"></div>
+      <div class="field w2">
+        <label>كشف الطلاب</label>
+        <select id="rosterSelect">
+          <option value="builtin3">ثاني متوسط - 3 (محمّل مسبقًا)</option>
+          <option value="custom">كشف مخصص / محفوظ</option>
+        </select>
+      </div>
+
+      <div class="field w2">
+        <label>تقارير Teams (يمكن اختيار أكثر من ملف)</label>
+        <input id="teamsFiles" type="file" accept=".csv,.txt" multiple>
+      </div>
+      <div class="field w2 custom-only hidden" id="customNameWrap">
+        <label>اسم الكشف المخصص</label>
+        <input id="customRosterName" placeholder="مثال: ثاني متوسط - 4">
+      </div>
+
+      <div class="field w4 custom-only hidden" id="customRosterWrap">
+        <label>أسماء الطلاب في الكشف المخصص — طالب في كل سطر</label>
+        <textarea id="customRoster" placeholder="الصق أسماء طلاب الفصل هنا، كل اسم في سطر مستقل. يمكنك حفظ الكشف لاستخدامه لاحقًا."></textarea>
+      </div>
+    </div>
+
+    <div class="actions">
+      <button class="primary" id="generateBtn">إنشاء التقرير</button>
+      <button class="secondary" id="saveRosterBtn">حفظ الكشف المخصص</button>
+      <button class="dark" id="printBtn">حفظ / طباعة PDF</button>
+      <button class="danger" id="clearBtn">مسح الملفات</button>
+    </div>
+    <div class="note" style="border-style:solid;background:#fffbea;border-color:#efd98b;color:#66531a">
+      على الآيفون: إذا فتح الملف داخل معاينة ChatGPT أو "الملفات" ولم تعمل الأزرار، افتحه في <b>Safari</b> ليعمل كأداة تفاعلية.
+    </div>
+    <div class="note">
+      المعيار المعتمد: أي طالب يظهر اسمه في تقرير Teams يُسجل <b>حاضرًا</b> مهما كانت مدة دخوله. الطالب غير الموجود في التقرير يُسجل <b>غائبًا</b>. المعلم أو أي شخص غير موجود في كشف الفصل لا يدخل ضمن أعداد الطلاب.
+    </div>
+    <div class="review" id="reviewBox">
+      <strong>مراجعة المطابقة</strong>
+      <ul id="reviewList"></ul>
+    </div>
+  </section>
+
+  <div class="sticky-action">
+    <button class="primary" id="generateBtnSticky">إنشاء التقرير</button>
+    <button class="dark" id="printBtnSticky">حفظ PDF</button>
+  </div>
+
+  <div class="report-shell">
+    <main class="paper" id="report">
+      <div class="topline">
+        <div class="gov">
+          المملكة العربية السعودية<br>وزارة التعليم
+          <small>الإدارة العامة للتعليم بمنطقة الرياض</small>
+        </div>
+        <div class="logo">
+          <div class="dots">•••••⌄•••••</div>
+          <div class="ar">وزارة التعليم</div>
+          <div class="en">Ministry of Education</div>
+        </div>
+        <div class="schoolbox">
+          المدرسة: <b id="rSchool">متوسطة معاوية بن خديج</b><br>
+          المعلم: <b id="rTeacher">محمد الجعيد</b>
+        </div>
+      </div>
+
+      <div class="title">تقرير الحضور للحصة الافتراضية</div>
+      <div class="subtitle" id="rMeetingTitle">Microsoft Teams</div>
+
+      <div class="meta">
+        <div class="card"><div class="lbl">التاريخ</div><div class="val" id="rDate">—</div></div>
+        <div class="card"><div class="lbl">المنصة</div><div class="val">Microsoft Teams</div></div>
+        <div class="card"><div class="lbl">مدة الاجتماع</div><div class="val" id="rMeetingDuration">—</div></div>
+        <div class="card"><div class="lbl">الصف / المادة</div><div class="val"><span id="rGrade">ثاني متوسط</span> - <span id="rSection">3</span> | <span id="rSubject">علوم</span></div></div>
+      </div>
+
+      <div class="summary">
+        <section class="panel">
+          <h3>الإحصائيات العامة</h3>
+          <div class="stats">
+            <div class="stat"><span>إجمالي الطلاب</span><b id="kTotal">32</b></div>
+            <div class="stat"><span>الحاضرون</span><b id="kPresent">0</b></div>
+            <div class="stat"><span>الغائبون</span><b id="kAbsent">32</b></div>
+            <div class="stat"><span>نسبة الحضور</span><b id="kRate">0%</b></div>
+            <div class="stat"><span>وقت البدء</span><b id="kStart">—</b></div>
+            <div class="stat"><span>وقت الانتهاء</span><b id="kEnd">—</b></div>
+          </div>
+        </section>
+
+        <section class="panel">
+          <h3>ملخص الحضور</h3>
+          <div class="kpirow">
+            <div class="bigkpi"><div class="num" id="bigPresent">0</div><div class="lab">طالب حاضر</div></div>
+            <div class="bigkpi"><div class="num" id="bigAbsent">32</div><div class="lab">طالب غائب</div></div>
+          </div>
+        </section>
+
+        <section class="panel">
+          <h3>توزيع حالات الحضور</h3>
+          <div class="donutwrap">
+            <div class="donut" id="donut" style="--deg:0deg"><strong id="donutRate">0%</strong></div>
+            <div class="legend">
+              <div><span class="dot g"></span> حاضر: <b id="legendPresent">0</b></div>
+              <div><span class="dot r"></span> غائب: <b id="legendAbsent">32</b></div>
+            </div>
+          </div>
+        </section>
+      </div>
+
+      <section class="tablebox">
+        <div class="tabletitle">تفاصيل حضور الطلاب</div>
+        <table>
+          <thead>
+            <tr>
+              <th style="width:6%">م</th>
+              <th style="width:44%">اسم الطالب</th>
+              <th style="width:20%">وقت الانضمام الأول</th>
+              <th style="width:18%">مدة الحضور</th>
+              <th style="width:12%">الحالة</th>
+            </tr>
+          </thead>
+          <tbody id="reportRows"></tbody>
+        </table>
+      </section>
+
+      <div class="footer">
+        <div class="sign"><b>معلم المادة</b><span id="fTeacher">محمد الجعيد</span></div>
+        <div class="sign"><b>مدير المدرسة</b><span id="fPrincipal">يوسف الشمري</span></div>
+      </div>
+      <div class="footnote">تقرير آلي مستخرج من بيانات الحضور في Microsoft Teams</div>
+    </main>
+  </div>
+</div>
+
+<script src="app.js"></script></body></html>
